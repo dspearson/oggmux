@@ -1,0 +1,18 @@
+[package]
+name = "oggmux"
+version = "0.1.0"
+authors = ["Dominic Pearson <dsp@technoanimal.net>"]
+edition = "2021"
+license = "ISC"
+description = "A remuxing kit for combined Ogg Vorbis streams"
+keywords = ["mux", "ogg", "vorbis"]
+repository = "https://github.com/dspearson/oggmux"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.97"
+bytes = "1.10.1"
+log = "0.4.27"
+ogg = "0.9.2"
+ogg_pager = "0.7.0"
+tokio = { version = "1.44.2", features = ["full"] }
