@@ -9,13 +9,16 @@
 //!
 //! ## Example
 //! ```rust,no_run
-//! use oggmux::OggMux;
+//! use oggmux::{OggMux, VorbisBitrateMode, VorbisConfig};
 //! use bytes::Bytes;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // Create a new OggMux with default configuration
-//!     let mux = OggMux::new();
+//!     // Create a new OggMux with custom configuration
+//!     let mux = OggMux::new().with_vorbis_config(VorbisConfig {
+//!         sample_rate: 44100,
+//!         bitrate: VorbisBitrateMode::CBR(192),
+//!     });
 //!
 //!     // Spawn the muxer and get the channels
 //!     let (input_tx, mut output_rx) = mux.spawn();
@@ -37,4 +40,4 @@ mod stream;
 mod timing;
 
 // Re-export public API
-pub use mux::{BufferConfig, OggMux, VorbisConfig};
+pub use mux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig};

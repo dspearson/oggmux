@@ -1,23 +1,25 @@
 use anyhow::Result;
 use bytes::Bytes;
-use oggmux::{BufferConfig, OggMux, VorbisConfig};
+use oggmux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-/// Helper function to create a new OggMux instance with custom buffer settings
 fn create_test_mux() -> OggMux {
-    OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 0.5, // Small target for quicker testing
-        max_chunk_size: 4096,
-    })
+    OggMux::new()
+        .with_buffer_config(BufferConfig {
+            buffered_seconds: 0.5,
+            max_chunk_size: 4096,
+        })
+        .with_vorbis_config(VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::CBR(320),
+        })
 }
 
-/// Helper function to get a fresh copy of the silence.ogg data
 fn get_silence_ogg() -> Bytes {
-    Bytes::from(include_bytes!("../resources/silence.ogg").to_vec())
+    Bytes::from_static(include_bytes!("../resources/silence_44100_320.ogg"))
 }
 
-/// Helper function to check if a byte slice contains Ogg page signatures
 fn contains_ogg_signatures(data: &[u8]) -> bool {
     data.windows(4).any(|window| window == b"OggS")
 }
@@ -41,7 +43,7 @@ async fn test_oggmux_construction() {
     // Create with custom Vorbis settings
     let mux = OggMux::new().with_vorbis_config(VorbisConfig {
         sample_rate: 48000,
-        bitrate_bps: 192_000.0,
+        bitrate: VorbisBitrateMode::CBR(192),
     });
     let (tx, _rx) = mux.spawn();
     drop(tx);
@@ -54,7 +56,7 @@ async fn test_oggmux_construction() {
         })
         .with_vorbis_config(VorbisConfig {
             sample_rate: 22050,
-            bitrate_bps: 64_000.0,
+            bitrate: VorbisBitrateMode::CBR(64),
         });
     let (tx, _rx) = mux.spawn();
     drop(tx);
@@ -319,7 +321,7 @@ async fn test_invalid_ogg_data() -> Result<()> {
 #[tokio::test]
 async fn test_truncated_ogg_data() -> Result<()> {
     // Get the silence.ogg data and truncate it
-    let mut truncated_ogg = include_bytes!("../resources/silence.ogg").to_vec();
+    let mut truncated_ogg = get_silence_ogg().to_vec();
     truncated_ogg.truncate(truncated_ogg.len() / 2);
 
     let mux = create_test_mux();
@@ -418,7 +420,7 @@ async fn test_large_buffer() -> Result<()> {
 #[tokio::test]
 async fn test_many_small_chunks() -> Result<()> {
     // Get the silence.ogg data and split it into small chunks
-    let silence_ogg = include_bytes!("../resources/silence.ogg").to_vec();
+    let silence_ogg = get_silence_ogg().to_vec();
     let chunk_size = 64; // Small chunk size
     let chunks: Vec<_> = silence_ogg
         .chunks(chunk_size)
@@ -570,22 +572,22 @@ async fn test_extreme_buffer_configuration() -> Result<()> {
     Ok(())
 }
 
-/// Test with various sample rates and bitrates
+/// Test with various sample rates and bitrates using CBR
 #[tokio::test]
-async fn test_various_audio_configurations() -> Result<()> {
+async fn test_various_cbr_configurations() -> Result<()> {
     // Test with different sample rates and bitrates
     let configurations = vec![
         VorbisConfig {
             sample_rate: 8000,
-            bitrate_bps: 64_000.0,
+            bitrate: VorbisBitrateMode::CBR(64),
         },
         VorbisConfig {
             sample_rate: 16000,
-            bitrate_bps: 96_000.0,
+            bitrate: VorbisBitrateMode::CBR(96),
         },
         VorbisConfig {
             sample_rate: 48000,
-            bitrate_bps: 256_000.0,
+            bitrate: VorbisBitrateMode::CBR(256),
         },
     ];
 
@@ -613,8 +615,57 @@ async fn test_various_audio_configurations() -> Result<()> {
 
         assert!(
             received_output,
-            "No output received for sample_rate={}, bitrate={}",
-            config.sample_rate, config.bitrate_bps
+            "No output received for sample_rate={}, bitrate={:?}",
+            config.sample_rate, config.bitrate
+        );
+
+        drop(tx);
+    }
+
+    Ok(())
+}
+
+/// Test with various VBR quality settings
+#[tokio::test]
+async fn test_vbr_quality_configurations() -> Result<()> {
+    // Test with different VBR quality settings
+    let configurations = vec![
+        VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::VBRQuality(3),
+        },
+        VorbisConfig {
+            sample_rate: 48000,
+            bitrate: VorbisBitrateMode::VBRQuality(6),
+        },
+    ];
+
+    for config in configurations {
+        let mux = OggMux::new().with_vorbis_config(config);
+        let (tx, mut rx) = mux.spawn();
+
+        // Send valid data
+        tx.send(get_silence_ogg()).await?;
+
+        // Verify we receive output
+        let mut received_output = false;
+        let start = Instant::now();
+
+        while start.elapsed() < Duration::from_millis(1000) {
+            tokio::select! {
+                Some(packet) = rx.recv() => {
+                    assert!(contains_ogg_signatures(&packet));
+                    received_output = true;
+                    break;
+                }
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        assert!(
+            received_output,
+            "No output received for sample_rate={}, bitrate={:?}",
+            config.sample_rate, config.bitrate
         );
 
         drop(tx);

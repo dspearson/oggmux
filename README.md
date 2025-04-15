@@ -14,7 +14,7 @@ A Rust library for muxing Ogg streams with clean silence gaps, suitable for stre
 ### Basic Example
 
 ```rust
-use oggmux::{OggMux, BufferConfig, VorbisConfig};
+use oggmux::{OggMux, BufferConfig, VorbisConfig, VorbisBitrateMode};
 use bytes::Bytes;
 use tokio::time::sleep;
 use std::time::Duration;
@@ -29,7 +29,7 @@ async fn main() {
         })
         .with_vorbis_config(VorbisConfig {
             sample_rate: 44100,
-            bitrate_bps: 320_000.0,
+            bitrate: VorbisBitrateMode::CBR(320),
         });
 
     // Spawn the muxer and get the channels
@@ -53,17 +53,30 @@ async fn main() {
 
 ```rust
 BufferConfig {
-    buffered_seconds: 10.0,    // Target amount of audio to keep buffered
-    max_chunk_size: 65536,     // Maximum chunk size to process at once
+    buffered_seconds: 10.0, // Target amount of audio to keep buffered
+    max_chunk_size: 65536,  // Maximum chunk size to process at once
 }
 ```
 
 ### Vorbis Configuration
 
+You can configure the vorbis stream in two ways:
+
+#### Constant Bitrate (CBR)
+
 ```rust
 VorbisConfig {
-    sample_rate: 44100,        // Sample rate in Hz
-    bitrate_bps: 320_000.0,    // Bitrate in bits per second
+    sample_rate: 44100,                   // Sample rate in Hz
+    bitrate: VorbisBitrateMode::CBR(320), // 320 kbps constant bitrate
+}
+```
+
+#### Variable Bitrate (VBR)
+
+```rust
+VorbisConfig {
+    sample_rate: 44100,                        // Sample rate in Hz
+    bitrate: VorbisBitrateMode::VBRQuality(6), // Quality level 6 VBR
 }
 ```
 

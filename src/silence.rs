@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn test_silence_template_creation() {
-        let silence_data = include_bytes!("../resources/silence.ogg");
+        let silence_data = include_bytes!("../resources/silence_default.ogg");
         let template = SilenceTemplate::new_embedded(silence_data);
         assert_eq!(template.raw_bytes(), silence_data.as_slice());
     }

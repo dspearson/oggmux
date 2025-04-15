@@ -188,7 +188,7 @@ mod tests {
 
     fn get_silence_ogg_data() -> Vec<u8> {
         // This should contain an Ogg container with an actual EOS page at the end
-        include_bytes!("../resources/silence.ogg").to_vec()
+        include_bytes!("../resources/silence_default.ogg").to_vec()
     }
 
     #[test]

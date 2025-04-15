@@ -14,17 +14,35 @@ use crate::timing::StreamClock;
 pub struct BufferConfig {
     /// Target amount of audio to keep buffered (in seconds)
     pub buffered_seconds: f64,
-    /// Maximum chunk size to process at once (in bytes)
+
     pub max_chunk_size: usize,
 }
 
+/// Bitrate mode for Vorbis encoding or template selection
+#[derive(Clone, Copy, Debug)]
+pub enum VorbisBitrateMode {
+    /// Constant Bitrate (CBR)
+    CBR(u32), // e.g., 192 (kbps)
+    /// Variable Bitrate (VBR) with quality level
+    VBRQuality(u8), // e.g., q6
+}
+
 /// Configuration for Vorbis audio parameters.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct VorbisConfig {
     /// Sample rate in Hz
     pub sample_rate: u32,
     /// Bitrate in bits per second
-    pub bitrate_bps: f64,
+    pub bitrate: VorbisBitrateMode,
+}
+
+impl VorbisConfig {
+    pub fn silence_key(&self) -> String {
+        match self.bitrate {
+            VorbisBitrateMode::CBR(kbps) => format!("{}_{}", self.sample_rate, kbps),
+            VorbisBitrateMode::VBRQuality(q) => format!("{}_q{}", self.sample_rate, q),
+        }
+    }
 }
 
 /// Single "session" that processes exactly one Ogg stream (real or silence).
@@ -87,7 +105,6 @@ impl StreamSession {
             return Ok(());
         }
 
-        // Real-data stream processing
         let mut last_action_time = Instant::now();
         let timeout = Duration::from_millis(500); // Timeout for considering input as invalid
 
@@ -119,13 +136,10 @@ impl StreamSession {
                         debug!("No valid output produced after timeout; breaking to restart with silence");
                         break;
                     }
-
                     // Sleep for a fixed duration regardless of the lead value.
                     sleep(Duration::from_millis(10)).await;
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
 
             if self.stream_processor.is_finished() {
@@ -169,21 +183,43 @@ pub struct OggMux {
 impl OggMux {
     /// Create a new OggMux with default configuration.
     pub fn new() -> Self {
+        let vorbis_config = VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::CBR(320),
+        };
+
+        let silence = Self::load_default_silence(&vorbis_config);
+
         Self {
             buffer_config: BufferConfig {
                 buffered_seconds: 10.0,
                 max_chunk_size: 65536,
             },
-            vorbis_config: VorbisConfig {
-                sample_rate: 44100,
-                bitrate_bps: 320_000.0,
-            },
-            silence: SilenceTemplate::new_embedded(include_bytes!("../resources/silence.ogg")),
+            vorbis_config,
+            silence,
             initial_serial: 0xfeed_0000,
         }
     }
 
     /// Configure buffer settings for the OggMux.
+    fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
+        match config.silence_key().as_str() {
+            "44100_192" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
+            }
+            "44100_128" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg"))
+            }
+            "44100_320" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg"))
+            }
+            "48000_q6" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg"))
+            }
+            _ => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg")),
+        }
+    }
+
     pub fn with_buffer_config(mut self, config: BufferConfig) -> Self {
         self.buffer_config = config;
         self
@@ -192,6 +228,12 @@ impl OggMux {
     /// Configure Vorbis audio parameters for the OggMux.
     pub fn with_vorbis_config(mut self, config: VorbisConfig) -> Self {
         self.vorbis_config = config;
+        self.silence = Self::load_default_silence(&self.vorbis_config);
+        self
+    }
+
+    pub fn with_silence_template(mut self, silence: SilenceTemplate) -> Self {
+        self.silence = silence;
         self
     }
 
@@ -310,26 +352,40 @@ impl Default for OggMux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{sleep, Duration};
+
+    #[test]
+    fn test_vorbis_config_silence_key_cbr() {
+        let cfg = VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::CBR(192),
+        };
+        assert_eq!(cfg.silence_key(), "44100_192");
+    }
+
+    #[test]
+    fn test_vorbis_config_silence_key_vbr() {
+        let cfg = VorbisConfig {
+            sample_rate: 48000,
+            bitrate: VorbisBitrateMode::VBRQuality(6),
+        };
+        assert_eq!(cfg.silence_key(), "48000_q6");
+    }
+
+    #[test]
+    fn test_default_mux_uses_expected_key() {
+        let mux = OggMux::new();
+        let key = mux.vorbis_config.silence_key();
+        assert_eq!(key, "44100_320");
+    }
 
     #[tokio::test]
-    async fn test_graceful_shutdown_on_channel_close() {
+    async fn test_mux_shutdown_behavior() {
         let mux = OggMux::new();
         let (input_tx, output_rx) = mux.spawn();
-
-        // Drop the output_rx to simulate consumer shutdown
         drop(output_rx);
-
-        // Send some data to input (won't be received)
-        let _ = input_tx
-            .send(Bytes::from_static(b"some fake ogg data"))
-            .await;
-
-        // Wait for background task to clean up
+        let _ = input_tx.send(Bytes::from_static(b"example")).await;
         sleep(Duration::from_millis(200)).await;
-
-        // Further sends should fail since the task should have exited
-        let send_result = input_tx.send(Bytes::from_static(b"data")).await;
-        assert!(send_result.is_err(), "Expected send to fail after shutdown");
+        let result = input_tx.send(Bytes::from_static(b"after close")).await;
+        assert!(result.is_err(), "Expected send to fail after shutdown");
     }
 }
