@@ -24,8 +24,7 @@ async fn main() {
     // Create a new OggMux with custom configuration
     let mux = OggMux::new()
         .with_buffer_config(BufferConfig {
-            target_buffered_secs: 10.0,
-            max_buffer_secs: 15.0,
+            buffered_seconds: 10.0,
             max_chunk_size: 4096,
         })
         .with_vorbis_config(VorbisConfig {
@@ -54,9 +53,8 @@ async fn main() {
 
 ```rust
 BufferConfig {
-    target_buffered_secs: 10.0,  // Target amount of audio to keep buffered
-    max_buffer_secs: 15.0,       // Maximum buffer size before throttling
-    max_chunk_size: 65536,       // Maximum chunk size to process at once
+    buffered_seconds: 10.0,    // Target amount of audio to keep buffered
+    max_chunk_size: 65536,     // Maximum chunk size to process at once
 }
 ```
 

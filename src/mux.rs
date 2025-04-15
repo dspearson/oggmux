@@ -13,9 +13,7 @@ use crate::timing::StreamClock;
 #[derive(Clone, Copy)]
 pub struct BufferConfig {
     /// Target amount of audio to keep buffered (in seconds)
-    pub target_buffered_secs: f64,
-    /// Maximum buffer size before throttling (in seconds)
-    pub max_buffer_secs: f64,
+    pub buffered_seconds: f64,
     /// Maximum chunk size to process at once (in bytes)
     pub max_chunk_size: usize,
 }
@@ -64,15 +62,14 @@ impl StreamSession {
         input_rx: &mut mpsc::Receiver<Bytes>,
         output_tx: &mpsc::Sender<Bytes>,
         clock: &StreamClock,
-        min_buffer: f64,
-        max_buffer: f64,
+        buffered_seconds: f64,
         granule_position_ref: &mut u64,
     ) -> Result<()> {
         if self.is_silence {
             if let Some(ref template) = self.silence_template {
                 let out = self.stream_processor.process(template)?;
                 if !out.is_empty() {
-                    self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                         .await;
                     if output_tx.send(out).await.is_err() {
                         return Ok(());
@@ -82,7 +79,7 @@ impl StreamSession {
             }
             let final_out = self.stream_processor.finalise()?;
             if !final_out.is_empty() {
-                self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                     .await;
                 let _ = output_tx.send(final_out).await;
             }
@@ -96,7 +93,7 @@ impl StreamSession {
 
         loop {
             let lead = clock.lead_secs(*granule_position_ref);
-            if lead >= max_buffer {
+            if lead >= buffered_seconds {
                 sleep(Duration::from_millis(20)).await;
             }
 
@@ -105,7 +102,7 @@ impl StreamSession {
                     last_action_time = Instant::now();
                     let out = self.stream_processor.process(&data)?;
                     if !out.is_empty() {
-                        self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                             .await;
                         if output_tx.send(out).await.is_err() {
                             break;
@@ -114,8 +111,6 @@ impl StreamSession {
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    let lead = clock.lead_secs(*granule_position_ref);
-
                     // Check if we've been waiting too long with no valid output
                     // This could indicate invalid data that doesn't parse properly
                     if !self.stream_processor.has_produced_output()
@@ -125,11 +120,8 @@ impl StreamSession {
                         break;
                     }
 
-                    if lead < min_buffer {
-                        sleep(Duration::from_millis(10)).await;
-                    } else {
-                        sleep(Duration::from_millis(10)).await;
-                    }
+                    // Sleep for a fixed duration regardless of the lead value.
+                    sleep(Duration::from_millis(10)).await;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     break;
@@ -143,7 +135,7 @@ impl StreamSession {
 
         let final_out = self.stream_processor.finalise()?;
         if !final_out.is_empty() {
-            self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                 .await;
             let _ = output_tx.send(final_out).await;
         }
@@ -152,10 +144,10 @@ impl StreamSession {
     }
 
     /// Sleep if we're generating output faster than real-time
-    async fn maybe_sleep(&self, clock: &StreamClock, max_buffer: f64, current_granule: u64) {
+    async fn maybe_sleep(&self, clock: &StreamClock, buffered_seconds: f64, current_granule: u64) {
         let lead = clock.lead_secs(current_granule);
-        if lead >= max_buffer {
-            while clock.lead_secs(current_granule) >= max_buffer {
+        if lead >= buffered_seconds {
+            while clock.lead_secs(current_granule) >= buffered_seconds {
                 sleep(Duration::from_millis(20)).await;
             }
         }
@@ -179,8 +171,7 @@ impl OggMux {
     pub fn new() -> Self {
         Self {
             buffer_config: BufferConfig {
-                target_buffered_secs: 10.0,
-                max_buffer_secs: 10.0,
+                buffered_seconds: 10.0,
                 max_chunk_size: 65536,
             },
             vorbis_config: VorbisConfig {
@@ -224,8 +215,7 @@ impl OggMux {
         let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
 
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
-        let min_buffer = self.buffer_config.target_buffered_secs;
-        let max_buffer = self.buffer_config.max_buffer_secs;
+        let buffered_seconds = self.buffer_config.buffered_seconds;
 
         let mut global_granule_position: u64 = 0;
 
@@ -233,51 +223,56 @@ impl OggMux {
             debug!("OggMux main loop started");
 
             loop {
-                // Attempt to read once from input
-                match input_rx.try_recv() {
-                    Ok(first_chunk) => {
-                        // We have real data => start a real session
-                        let serial = self.next_serial();
-                        debug!("Starting REAL stream, serial=0x{:x}", serial);
+                // Shutdown if output is closed
+                if output_tx.is_closed() {
+                    debug!("Output channel closed; exiting mux loop");
+                    break;
+                }
 
-                        let mut session = StreamSession::new_real(serial, global_granule_position);
-                        // Feed the chunk we just pulled
-                        match session.stream_processor.process(&first_chunk) {
-                            Ok(out) => {
-                                if !out.is_empty() {
-                                    session
-                                        .maybe_sleep(&clock, max_buffer, global_granule_position)
-                                        .await;
-                                    let _ = output_tx.send(out).await;
+                tokio::select! {
+                    maybe_input = input_rx.recv() => {
+                        match maybe_input {
+                            Some(first_chunk) => {
+                                let serial = self.next_serial();
+                                debug!("Starting REAL stream, serial=0x{:x}", serial);
+
+                                let mut session = StreamSession::new_real(serial, global_granule_position);
+
+                                match session.stream_processor.process(&first_chunk) {
+                                    Ok(out) => {
+                                        if !out.is_empty() && !output_tx.is_closed() {
+                                            session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
+                                            let _ = output_tx.send(out).await;
+                                        }
+                                        global_granule_position = session.stream_processor.get_granule_position();
+                                    }
+                                    Err(e) => {
+                                        error!("Error processing first chunk: {:?}", e);
+                                        continue;
+                                    }
                                 }
-                                global_granule_position =
-                                    session.stream_processor.get_granule_position();
-                            }
-                            Err(e) => {
-                                error!("Error processing first chunk: {:?}", e);
-                                continue;
-                            }
-                        }
 
-                        // Now let the session run
-                        if let Err(e) = session
-                            .run(
-                                &mut input_rx,
-                                &output_tx,
-                                &clock,
-                                min_buffer,
-                                max_buffer,
-                                &mut global_granule_position,
-                            )
-                            .await
-                        {
-                            error!("Session run error: {:?}", e);
+                                if let Err(e) = session.run(
+                                    &mut input_rx,
+                                    &output_tx,
+                                    &clock,
+                                    buffered_seconds,
+                                    &mut global_granule_position
+                                ).await {
+                                    error!("Session run error: {:?}", e);
+                                }
+                            }
+                            None => {
+                                debug!("Input channel closed; exiting mux loop");
+                                break;
+                            }
                         }
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        // No data => do silence
+
+                    // Optional timeout to insert silence if input is idle
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         let serial = self.next_serial();
-                        debug!("Starting SILENCE stream, serial=0x{:x}", serial);
+                        debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
 
                         let silence_data = self.silence.raw_bytes().to_vec().into();
                         let mut session = StreamSession::new_silence(
@@ -286,23 +281,15 @@ impl OggMux {
                             silence_data,
                         );
 
-                        if let Err(e) = session
-                            .run(
-                                &mut input_rx,
-                                &output_tx,
-                                &clock,
-                                min_buffer,
-                                max_buffer,
-                                &mut global_granule_position,
-                            )
-                            .await
-                        {
+                        if let Err(e) = session.run(
+                            &mut input_rx,
+                            &output_tx,
+                            &clock,
+                            buffered_seconds,
+                            &mut global_granule_position
+                        ).await {
                             error!("Silence session error: {:?}", e);
                         }
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!("Input disconnected; finishing");
-                        break;
                     }
                 }
             }
@@ -317,5 +304,32 @@ impl OggMux {
 impl Default for OggMux {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_on_channel_close() {
+        let mux = OggMux::new();
+        let (input_tx, output_rx) = mux.spawn();
+
+        // Drop the output_rx to simulate consumer shutdown
+        drop(output_rx);
+
+        // Send some data to input (won't be received)
+        let _ = input_tx
+            .send(Bytes::from_static(b"some fake ogg data"))
+            .await;
+
+        // Wait for background task to clean up
+        sleep(Duration::from_millis(200)).await;
+
+        // Further sends should fail since the task should have exited
+        let send_result = input_tx.send(Bytes::from_static(b"data")).await;
+        assert!(send_result.is_err(), "Expected send to fail after shutdown");
     }
 }

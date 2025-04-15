@@ -273,7 +273,7 @@ mod tests {
 
         // At least one of the outputs should contain data
         assert!(
-            out1.len() > 0 || out2.len() > 0,
+            !out1.is_empty() || !out2.is_empty(),
             "No output produced from split data"
         );
 
@@ -341,7 +341,7 @@ mod tests {
         let out = sp.process(&large_data)?;
 
         // We should get substantial output
-        assert!(out.len() > 0, "No output from large buffer");
+        assert!(!out.is_empty(), "No output from large buffer");
 
         Ok(())
     }

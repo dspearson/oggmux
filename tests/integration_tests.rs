@@ -7,8 +7,7 @@ use tokio::time::sleep;
 /// Helper function to create a new OggMux instance with custom buffer settings
 fn create_test_mux() -> OggMux {
     OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 0.5, // Small target for quicker testing
-        max_buffer_secs: 1.0,
+        buffered_seconds: 0.5, // Small target for quicker testing
         max_chunk_size: 4096,
     })
 }
@@ -33,8 +32,7 @@ async fn test_oggmux_construction() {
 
     // Create with custom buffer settings
     let mux = OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 5.0,
-        max_buffer_secs: 8.0,
+        buffered_seconds: 5.0,
         max_chunk_size: 8192,
     });
     let (tx, _rx) = mux.spawn();
@@ -51,8 +49,7 @@ async fn test_oggmux_construction() {
     // Create with both custom settings
     let mux = OggMux::new()
         .with_buffer_config(BufferConfig {
-            target_buffered_secs: 3.0,
-            max_buffer_secs: 6.0,
+            buffered_seconds: 3.0,
             max_chunk_size: 4096,
         })
         .with_vorbis_config(VorbisConfig {
@@ -369,8 +366,7 @@ async fn test_truncated_ogg_data() -> Result<()> {
 #[tokio::test]
 async fn test_large_buffer() -> Result<()> {
     let mux = OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 5.0,
-        max_buffer_secs: 10.0,
+        buffered_seconds: 5.0,
         max_chunk_size: 65536,
     });
 
@@ -521,8 +517,7 @@ async fn test_recovery_after_invalid_data() -> Result<()> {
 async fn test_extreme_buffer_configuration() -> Result<()> {
     // Very small buffer
     let small_buffer_mux = OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 0.1,
-        max_buffer_secs: 0.2,
+        buffered_seconds: 0.1,
         max_chunk_size: 1024,
     });
 
@@ -531,8 +526,7 @@ async fn test_extreme_buffer_configuration() -> Result<()> {
 
     // Very large buffer
     let large_buffer_mux = OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 30.0,
-        max_buffer_secs: 60.0,
+        buffered_seconds: 30.0,
         max_chunk_size: 1_048_576,
     });
 
@@ -694,8 +688,7 @@ async fn test_long_running_stability() -> Result<()> {
 
     // Use a mux with slightly faster output for testing
     let mux = OggMux::new().with_buffer_config(BufferConfig {
-        target_buffered_secs: 0.3, // Smaller buffer for more frequent output
-        max_buffer_secs: 0.5,
+        buffered_seconds: 0.3, // Smaller buffer for more frequent output
         max_chunk_size: 4096,
     });
 
