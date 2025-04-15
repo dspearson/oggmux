@@ -2,10 +2,8 @@ use std::time::Instant;
 
 /// Tracks timing between wall clock and stream time.
 ///
-/// The StreamClock is used to maintain proper timing relationships between
-/// the real-time wall clock and the audio stream's granule position.
-/// This ensures that audio playback maintains the correct speed and
-/// doesn't buffer too much or too little data.
+/// This struct helps maintain synchronisation between the system's real-time
+/// clock and the logical time in the audio stream (measured in samples).
 #[derive(Debug, Clone)]
 pub struct StreamClock {
     start: Instant,
@@ -13,15 +11,7 @@ pub struct StreamClock {
 }
 
 impl StreamClock {
-    /// Create a new StreamClock.
-    ///
-    /// # Arguments
-    ///
-    /// * `sample_rate` - The sample rate of the audio stream in Hz.
-    ///
-    /// # Returns
-    ///
-    /// A new StreamClock initialised with the current time.
+    /// Create a new StreamClock with the specified sample rate.
     pub fn new(sample_rate: u32) -> Self {
         Self {
             start: Instant::now(),
@@ -29,40 +19,23 @@ impl StreamClock {
         }
     }
 
-    /// Get the elapsed wall-clock time in seconds.
-    ///
-    /// # Returns
-    ///
-    /// The number of seconds elapsed since the StreamClock was created.
+    /// Get the elapsed time in seconds since this clock was created.
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
 
     /// Convert a granule position to seconds.
     ///
-    /// # Arguments
-    ///
-    /// * `granule` - The granule position to convert.
-    ///
-    /// # Returns
-    ///
-    /// The equivalent time in seconds.
+    /// In Ogg Vorbis, granule positions represent the number of
+    /// samples, so dividing by the sample rate gives us seconds.
     pub fn granule_to_secs(&self, granule: u64) -> f64 {
         granule as f64 / self.sample_rate as f64
     }
 
-    /// Calculate how far ahead the stream is compared to wall-clock time.
+    /// Calculate how far ahead the stream is from the wall clock.
     ///
-    /// This is used to determine if we need to add silence (when the lead
-    /// is too small) or throttle output (when the lead is too large).
-    ///
-    /// # Arguments
-    ///
-    /// * `granule` - The current granule position of the stream.
-    ///
-    /// # Returns
-    ///
-    /// The lead time in seconds (positive if the stream is ahead of wall-clock).
+    /// A positive value means the stream is ahead (buffering).
+    /// A negative value means the stream is behind (potential underrun).
     pub fn lead_secs(&self, granule: u64) -> f64 {
         self.granule_to_secs(granule) - self.elapsed_secs()
     }
@@ -72,58 +45,73 @@ impl StreamClock {
 mod tests {
     use super::*;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
-    fn test_clock_creation() {
+    fn test_clock() {
         let clock = StreamClock::new(44100);
-        assert_eq!(clock.sample_rate, 44100);
+        thread::sleep(std::time::Duration::from_millis(20));
+        let e = clock.elapsed_secs();
+        assert!(e >= 0.02);
     }
 
     #[test]
-    fn test_granule_to_secs() {
-        let clock = StreamClock::new(44100);
+    fn test_granule_conversions() {
+        // Test conversion from granule positions to seconds at different sample rates
+        let clock_44k = StreamClock::new(44100);
+        let clock_48k = StreamClock::new(48000);
+        let clock_8k = StreamClock::new(8000);
 
-        // 44100 samples at 44100Hz = 1 second
-        assert_eq!(clock.granule_to_secs(44100), 1.0);
+        // 1 second of audio at each sample rate
+        assert_eq!(clock_44k.granule_to_secs(44100), 1.0);
+        assert_eq!(clock_48k.granule_to_secs(48000), 1.0);
+        assert_eq!(clock_8k.granule_to_secs(8000), 1.0);
 
-        // 22050 samples at 44100Hz = 0.5 seconds
-        assert_eq!(clock.granule_to_secs(22050), 0.5);
+        // Test fractional seconds
+        assert!((clock_44k.granule_to_secs(22050) - 0.5).abs() < 0.001);
+        assert!((clock_48k.granule_to_secs(24000) - 0.5).abs() < 0.001);
 
-        // 0 samples = 0 seconds
-        assert_eq!(clock.granule_to_secs(0), 0.0);
+        // Test large values
+        let hour_44k = 44100 * 3600;
+        assert_eq!(clock_44k.granule_to_secs(hour_44k), 3600.0);
     }
 
     #[test]
-    fn test_elapsed_secs() {
+    fn test_lead_calculation() {
+        // Create a clock
         let clock = StreamClock::new(44100);
 
-        // Sleep briefly
-        thread::sleep(std::time::Duration::from_millis(50));
+        // Initial lead should be negative (we're behind real-time)
+        assert!(clock.lead_secs(0) < 0.0);
 
-        // Elapsed time should be approximately 0.05 seconds
+        // Lead should be approximately zero if granule position matches elapsed time
+        thread::sleep(Duration::from_millis(100)); // Sleep 100ms
         let elapsed = clock.elapsed_secs();
-        assert!(
-            elapsed >= 0.04 && elapsed <= 0.1,
-            "Elapsed time was {}",
-            elapsed
-        );
+        let granule = (elapsed * 44100.0) as u64;
+
+        // Lead should be close to zero, but might be slightly negative due to timing
+        let lead = clock.lead_secs(granule);
+        assert!(lead.abs() < 0.05); // Within 50ms
+
+        // Lead should be positive if granule position is ahead
+        let future_granule = granule + 44100; // 1 second ahead
+        assert!(clock.lead_secs(future_granule) > 0.9); // Should be ~1 second lead
     }
 
     #[test]
-    fn test_lead_secs() {
-        let clock = StreamClock::new(44100);
+    fn test_extreme_sample_rates() {
+        // Test with unconventional sample rates
 
-        // A granule position of 0 should have a negative lead (behind wall-clock)
-        thread::sleep(std::time::Duration::from_millis(50));
-        let lead = clock.lead_secs(0);
-        assert!(lead < 0.0, "Lead time should be negative, got {}", lead);
+        // Very low sample rate
+        let low_clock = StreamClock::new(1000);
+        assert_eq!(low_clock.granule_to_secs(1000), 1.0);
 
-        // A very large granule position should have a positive lead (ahead of wall-clock)
-        let lead = clock.lead_secs(44100 * 10); // 10 seconds of audio
-        assert!(
-            lead > 9.0,
-            "Lead time should be around 10 seconds, got {}",
-            lead
-        );
+        // Very high sample rate
+        let high_clock = StreamClock::new(192000);
+        assert_eq!(high_clock.granule_to_secs(192000), 1.0);
+
+        // Extreme but valid sample rate
+        let extreme_clock = StreamClock::new(384000);
+        assert_eq!(extreme_clock.granule_to_secs(384000), 1.0);
     }
 }

@@ -8,7 +8,6 @@
 //! buffering to handle network jitter.
 //!
 //! ## Example
-//!
 //! ```rust,no_run
 //! use oggmux::OggMux;
 //! use bytes::Bytes;
@@ -27,19 +26,11 @@
 //!
 //!     // Read the processed output (e.g., send to Icecast)
 //!     while let Some(output) = output_rx.recv().await {
-//!         // Send output to your streaming destination
 //!         println!("Got {} bytes of output", output.len());
 //!     }
 //! }
 //! ```
-//!
-//! ## Error handling
-//!
-//! OggMux uses the `anyhow` crate for error handling, which provides rich error
-//! context and easy error propagation. Most internal errors are handled gracefully
-//! and logged, allowing the streaming process to continue whenever possible.
 
-mod controller;
 mod mux;
 mod silence;
 mod stream;

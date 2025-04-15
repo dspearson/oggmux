@@ -24,8 +24,8 @@ async fn main() {
     // Create a new OggMux with custom configuration
     let mux = OggMux::new()
         .with_buffer_config(BufferConfig {
-            target_buffered_secs: 5.0,
-            max_buffer_secs: 10.0,
+            target_buffered_secs: 10.0,
+            max_buffer_secs: 15.0,
             max_chunk_size: 4096,
         })
         .with_vorbis_config(VorbisConfig {

@@ -1,52 +1,172 @@
+use anyhow::Result;
 use bytes::Bytes;
 use log::{debug, error};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
-use crate::controller::MuxController;
 use crate::silence::SilenceTemplate;
+use crate::stream::StreamProcessor;
 use crate::timing::StreamClock;
 
 /// Configuration for buffer management.
-///
-/// Controls how much audio should be buffered and the maximum chunk size for
-/// processing.
 #[derive(Clone, Copy)]
 pub struct BufferConfig {
-    /// Target buffered time in seconds.
-    ///
-    /// The muxer will aim to keep this much audio buffered at all times.
-    /// When the buffer falls below this level, silence will be inserted.
+    /// Target amount of audio to keep buffered (in seconds)
     pub target_buffered_secs: f64,
-
-    /// Maximum buffer size in seconds.
-    ///
-    /// When the buffer exceeds this size, the muxer will throttle output
-    /// until the buffer decreases.
+    /// Maximum buffer size before throttling (in seconds)
     pub max_buffer_secs: f64,
-
-    /// Maximum chunk size to read at once in bytes.
+    /// Maximum chunk size to process at once (in bytes)
     pub max_chunk_size: usize,
 }
 
 /// Configuration for Vorbis audio parameters.
-///
-/// Used for timing calculations and stream rate estimation.
 #[derive(Clone, Copy)]
 pub struct VorbisConfig {
-    /// Sample rate in Hz.
+    /// Sample rate in Hz
     pub sample_rate: u32,
-
-    /// Bitrate in bits per second.
+    /// Bitrate in bits per second
     pub bitrate_bps: f64,
 }
 
-/// The main OggMux controller.
+/// Single "session" that processes exactly one Ogg stream (real or silence).
+struct StreamSession {
+    stream_processor: StreamProcessor,
+    is_silence: bool,
+    silence_template: Option<Bytes>,
+}
+
+impl StreamSession {
+    /// Create a new session for processing real audio data
+    fn new_real(serial: u32, base_granule: u64) -> Self {
+        Self {
+            stream_processor: StreamProcessor::with_serial(serial, base_granule),
+            is_silence: false,
+            silence_template: None,
+        }
+    }
+
+    /// Create a new session for generating silence
+    fn new_silence(serial: u32, base_granule: u64, template: Bytes) -> Self {
+        Self {
+            stream_processor: StreamProcessor::with_silence(serial, base_granule),
+            is_silence: true,
+            silence_template: Some(template),
+        }
+    }
+
+    /// Run until the stream is finished (EOS) or no more data.
+    ///
+    /// For silence, we just process the template once and finalise.
+    /// For real data, we process until we reach EOS or run out of input.
+    async fn run(
+        &mut self,
+        input_rx: &mut mpsc::Receiver<Bytes>,
+        output_tx: &mpsc::Sender<Bytes>,
+        clock: &StreamClock,
+        min_buffer: f64,
+        max_buffer: f64,
+        granule_position_ref: &mut u64,
+    ) -> Result<()> {
+        if self.is_silence {
+            if let Some(ref template) = self.silence_template {
+                let out = self.stream_processor.process(template)?;
+                if !out.is_empty() {
+                    self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                        .await;
+                    if output_tx.send(out).await.is_err() {
+                        return Ok(());
+                    }
+                    *granule_position_ref = self.stream_processor.get_granule_position();
+                }
+            }
+            let final_out = self.stream_processor.finalise()?;
+            if !final_out.is_empty() {
+                self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                    .await;
+                let _ = output_tx.send(final_out).await;
+            }
+            *granule_position_ref = self.stream_processor.get_granule_position();
+            return Ok(());
+        }
+
+        // Real-data stream processing
+        let mut last_action_time = Instant::now();
+        let timeout = Duration::from_millis(500); // Timeout for considering input as invalid
+
+        loop {
+            let lead = clock.lead_secs(*granule_position_ref);
+            if lead >= max_buffer {
+                sleep(Duration::from_millis(20)).await;
+            }
+
+            match input_rx.try_recv() {
+                Ok(data) => {
+                    last_action_time = Instant::now();
+                    let out = self.stream_processor.process(&data)?;
+                    if !out.is_empty() {
+                        self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                            .await;
+                        if output_tx.send(out).await.is_err() {
+                            break;
+                        }
+                    }
+                    *granule_position_ref = self.stream_processor.get_granule_position();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    let lead = clock.lead_secs(*granule_position_ref);
+
+                    // Check if we've been waiting too long with no valid output
+                    // This could indicate invalid data that doesn't parse properly
+                    if !self.stream_processor.has_produced_output()
+                        && last_action_time.elapsed() > timeout
+                    {
+                        debug!("No valid output produced after timeout; breaking to restart with silence");
+                        break;
+                    }
+
+                    if lead < min_buffer {
+                        sleep(Duration::from_millis(10)).await;
+                    } else {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+
+            if self.stream_processor.is_finished() {
+                break;
+            }
+        }
+
+        let final_out = self.stream_processor.finalise()?;
+        if !final_out.is_empty() {
+            self.maybe_sleep(clock, max_buffer, *granule_position_ref)
+                .await;
+            let _ = output_tx.send(final_out).await;
+        }
+        *granule_position_ref = self.stream_processor.get_granule_position();
+        Ok(())
+    }
+
+    /// Sleep if we're generating output faster than real-time
+    async fn maybe_sleep(&self, clock: &StreamClock, max_buffer: f64, current_granule: u64) {
+        let lead = clock.lead_secs(current_granule);
+        if lead >= max_buffer {
+            while clock.lead_secs(current_granule) >= max_buffer {
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// The main OggMux.
 ///
-/// OggMux provides a simple API for muxing Ogg audio streams with silence gaps.
-/// It automatically inserts silence when real audio data is not available,
-/// maintains proper timing across stream transitions, and provides configurable
-/// buffering to handle network jitter.
+/// This struct handles the muxing of Ogg streams, automatically inserting
+/// silence when no real audio data is available, and ensuring proper timing
+/// across stream transitions.
 pub struct OggMux {
     buffer_config: BufferConfig,
     vorbis_config: VorbisConfig,
@@ -56,14 +176,6 @@ pub struct OggMux {
 
 impl OggMux {
     /// Create a new OggMux with default configuration.
-    ///
-    /// Default settings:
-    /// - `target_buffered_secs`: 10.0
-    /// - `max_buffer_secs`: 10.0
-    /// - `max_chunk_size`: 65536
-    /// - `sample_rate`: 44100
-    /// - `bitrate_bps`: 320_000.0
-    /// - `initial_serial`: 0xfeed_0000
     pub fn new() -> Self {
         Self {
             buffer_config: BufferConfig {
@@ -80,117 +192,122 @@ impl OggMux {
         }
     }
 
-    /// Configure buffer parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The buffer configuration to use.
+    /// Configure buffer settings for the OggMux.
     pub fn with_buffer_config(mut self, config: BufferConfig) -> Self {
         self.buffer_config = config;
         self
     }
 
-    /// Configure Vorbis parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The Vorbis configuration to use.
+    /// Configure Vorbis audio parameters for the OggMux.
     pub fn with_vorbis_config(mut self, config: VorbisConfig) -> Self {
         self.vorbis_config = config;
         self
     }
 
-    /// Spawn the OggMux processor.
-    ///
-    /// Returns a pair of channels:
-    /// - A sender for raw Ogg input
-    /// - A receiver for processed Ogg output
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use oggmux::OggMux;
-    /// use bytes::Bytes;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mux = OggMux::new();
-    ///     let (input_tx, mut output_rx) = mux.spawn();
-    ///
-    ///     // Send some Ogg data
-    ///     let ogg_data = Bytes::from_static(&[/* Ogg data here */]);
-    ///     let _ = input_tx.send(ogg_data).await;
-    ///
-    ///     // Receive processed output
-    ///     if let Some(output) = output_rx.recv().await {
-    ///         println!("Got {} bytes of output", output.len());
-    ///     }
-    /// }
-    /// ```
-    pub fn spawn(self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
-        debug!("Spawning OggMux");
+    /// Generate a new serial number each time we spawn a stream.
+    fn next_serial(&mut self) -> u32 {
+        let s = self.initial_serial;
+        self.initial_serial = self.initial_serial.wrapping_add(1);
+        s
+    }
 
-        let (input_tx, mut input_rx) = mpsc::channel(self.buffer_config.max_chunk_size);
-        let (output_tx, output_rx) = mpsc::channel(self.buffer_config.max_chunk_size);
+    /// Spawn the main muxer loop: returns (input_tx, output_rx).
+    ///
+    /// - Send real Ogg data into `input_tx`.
+    /// - Muxed output arrives on `output_rx`.
+    ///
+    /// The muxer automatically inserts silence when no input is available,
+    /// and manages transitions between real audio and silence to maintain
+    /// proper timing.
+    pub fn spawn(mut self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
+        let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
 
-        let mut controller = MuxController::new(self.silence, self.initial_serial);
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
-
         let min_buffer = self.buffer_config.target_buffered_secs;
         let max_buffer = self.buffer_config.max_buffer_secs;
 
+        let mut global_granule_position: u64 = 0;
+
         tokio::spawn(async move {
-            debug!("OggMux started");
+            debug!("OggMux main loop started");
 
             loop {
-                // Check how many seconds (based on granule position) we are ahead of wall‑clock.
-                let lead = clock.lead_secs(controller.get_granule_position());
-
-                // If the lead exceeds max_buffer (e.g. 10 seconds), sleep before outputting more pages.
-                if lead >= max_buffer {
-                    sleep(Duration::from_millis(20)).await;
-                    continue;
-                }
-
+                // Attempt to read once from input
                 match input_rx.try_recv() {
-                    Ok(data) => match controller.process(Some(data)) {
-                        Ok(output) if !output.is_empty() => {
-                            if output_tx.send(output).await.is_err() {
-                                break;
+                    Ok(first_chunk) => {
+                        // We have real data => start a real session
+                        let serial = self.next_serial();
+                        debug!("Starting REAL stream, serial=0x{:x}", serial);
+
+                        let mut session = StreamSession::new_real(serial, global_granule_position);
+                        // Feed the chunk we just pulled
+                        match session.stream_processor.process(&first_chunk) {
+                            Ok(out) => {
+                                if !out.is_empty() {
+                                    session
+                                        .maybe_sleep(&clock, max_buffer, global_granule_position)
+                                        .await;
+                                    let _ = output_tx.send(out).await;
+                                }
+                                global_granule_position =
+                                    session.stream_processor.get_granule_position();
+                            }
+                            Err(e) => {
+                                error!("Error processing first chunk: {:?}", e);
+                                continue;
                             }
                         }
-                        Ok(_) => {}
-                        Err(e) => error!("Error processing real input: {e:?}"),
-                    },
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        // If there isn't enough data buffered (lead is below our target),
-                        // process a silence frame to fill up the gap.
-                        if lead < min_buffer {
-                            match controller.process(None) {
-                                Ok(output) if !output.is_empty() => {
-                                    if output_tx.send(output).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(e) => error!("Error processing silence: {e:?}"),
-                            }
-                        } else {
-                            sleep(Duration::from_millis(10)).await;
+
+                        // Now let the session run
+                        if let Err(e) = session
+                            .run(
+                                &mut input_rx,
+                                &output_tx,
+                                &clock,
+                                min_buffer,
+                                max_buffer,
+                                &mut global_granule_position,
+                            )
+                            .await
+                        {
+                            error!("Session run error: {:?}", e);
                         }
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        match controller.finalize() {
-                            Ok(output) if !output.is_empty() => {
-                                let _ = output_tx.send(output).await;
-                            }
-                            Err(e) => error!("Error finalising stream: {e:?}"),
-                            _ => {}
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No data => do silence
+                        let serial = self.next_serial();
+                        debug!("Starting SILENCE stream, serial=0x{:x}", serial);
+
+                        let silence_data = self.silence.raw_bytes().to_vec().into();
+                        let mut session = StreamSession::new_silence(
+                            serial,
+                            global_granule_position,
+                            silence_data,
+                        );
+
+                        if let Err(e) = session
+                            .run(
+                                &mut input_rx,
+                                &output_tx,
+                                &clock,
+                                min_buffer,
+                                max_buffer,
+                                &mut global_granule_position,
+                            )
+                            .await
+                        {
+                            error!("Silence session error: {:?}", e);
                         }
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        debug!("Input disconnected; finishing");
                         break;
                     }
                 }
             }
+
+            debug!("OggMux main loop ended");
         });
 
         (input_tx, output_rx)
