@@ -1,6 +1,6 @@
 [package]
 name = "oggmux"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Dominic Pearson <dsp@technoanimal.net>"]
 edition = "2021"
 license = "ISC"

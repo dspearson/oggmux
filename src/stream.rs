@@ -93,10 +93,19 @@ impl StreamProcessor {
         while let Ok(mut page) = Page::read(&mut cursor) {
             let end = cursor.position() as usize;
 
-            // Calculate the new absolute granule position based on the last input
+            // Handle missing granule (abgp == -1) by replaying last known output
             let input_abgp = page.header().abgp;
-            let delta = input_abgp.saturating_sub(self.last_input_abgp);
-            let new_abgp = self.last_output_abgp + delta;
+            let new_abgp = if input_abgp == u64::MAX {
+                // no timestamp: reuse last output granule
+                self.last_output_abgp
+            } else {
+                // valid granule: advance by delta
+                let delta = input_abgp.saturating_sub(self.last_input_abgp);
+                let pos = self.last_output_abgp + delta;
+                self.last_input_abgp = input_abgp;
+                self.last_output_abgp = pos;
+                pos
+            };
 
             // Rewrite the page header
             {
@@ -111,8 +120,6 @@ impl StreamProcessor {
             out.extend_from_slice(&page.as_bytes());
 
             // Update our tracking
-            self.last_input_abgp = input_abgp;
-            self.last_output_abgp = new_abgp;
             self.sequence_number += 1;
             consumed = end;
             self.has_output = true;
@@ -393,6 +400,54 @@ mod tests {
             "Finished processor should not produce output"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_processor_replays_last_granule_on_neg_one() -> Result<()> {
+        let data = get_silence_ogg_data();
+        // Read only the first page to avoid EOS
+        let mut cursor = Cursor::new(&data);
+        let mut page = Page::read(&mut cursor)?;
+        let page_end = cursor.position() as usize;
+        let first_bytes = &data[..page_end];
+
+        // Initialize processor at offset 100
+        let mut sp = StreamProcessor::with_serial(0x01, 100);
+        let out1 = sp.process(first_bytes)?;
+        assert!(!out1.is_empty(), "Should produce output on first page");
+        let baseline = sp.get_granule_position();
+        assert!(baseline >= 100);
+
+        // Create a page with abgp = -1 (u64::MAX)
+        {
+            let hdr = page.header_mut();
+            hdr.abgp = u64::MAX;
+        }
+        page.gen_crc();
+        let neg_one_bytes = page.as_bytes().to_vec();
+
+        // Feed the modified page
+        let out2 = sp.process(&neg_one_bytes)?;
+        assert!(!out2.is_empty(), "Should emit page even with -1 granule");
+
+        // Granule position should remain at baseline
+        assert_eq!(
+            sp.get_granule_position(),
+            baseline,
+            "Granule should not advance on -1 marker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_processor_advances_on_valid_granule() -> Result<()> {
+        let data = get_silence_ogg_data();
+        let mut sp = StreamProcessor::with_serial(0x02, 200);
+        let out = sp.process(&data)?;
+        assert!(!out.is_empty());
+        // Should advance from the starting position
+        assert!(sp.get_granule_position() > 200);
         Ok(())
     }
 }
