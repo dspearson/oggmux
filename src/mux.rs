@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{debug, error};
 use std::time::Instant;
@@ -15,6 +15,7 @@ pub struct BufferConfig {
     /// Target amount of audio to keep buffered (in seconds)
     pub buffered_seconds: f64,
 
+    /// Maximum number of buffered chunks in the channel
     pub max_chunk_size: usize,
 }
 
@@ -22,9 +23,9 @@ pub struct BufferConfig {
 #[derive(Clone, Copy, Debug)]
 pub enum VorbisBitrateMode {
     /// Constant Bitrate (CBR)
-    CBR(u32), // e.g., 192 (kbps)
+    CBR(u32),
     /// Variable Bitrate (VBR) with quality level
-    VBRQuality(u8), // e.g., q6
+    VBRQuality(u8),
 }
 
 /// Configuration for Vorbis audio parameters.
@@ -32,11 +33,12 @@ pub enum VorbisBitrateMode {
 pub struct VorbisConfig {
     /// Sample rate in Hz
     pub sample_rate: u32,
-    /// Bitrate in bits per second
+    /// Bitrate mode
     pub bitrate: VorbisBitrateMode,
 }
 
 impl VorbisConfig {
+    /// Generate a key string for selecting a matching silence template
     pub fn silence_key(&self) -> String {
         match self.bitrate {
             VorbisBitrateMode::CBR(kbps) => format!("{}_{}", self.sample_rate, kbps),
@@ -85,28 +87,36 @@ impl StreamSession {
     ) -> Result<()> {
         if self.is_silence {
             if let Some(ref template) = self.silence_template {
-                let out = self.stream_processor.process(template)?;
+                let out = self
+                    .stream_processor
+                    .process(template)
+                    .context("processing silence template")?;
                 if !out.is_empty() {
-                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                        .await;
-                    if output_tx.send(out).await.is_err() {
-                        return Ok(());
-                    }
+                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+                    output_tx
+                        .send(out)
+                        .await
+                        .context("sending silence packet")?;
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
             }
-            let final_out = self.stream_processor.finalise()?;
+            let final_out = self
+                .stream_processor
+                .finalise()
+                .context("finalising silence stream")?;
             if !final_out.is_empty() {
-                self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                    .await;
-                let _ = output_tx.send(final_out).await;
+                self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+                output_tx
+                    .send(final_out)
+                    .await
+                    .context("sending final silence packet")?;
             }
             *granule_position_ref = self.stream_processor.get_granule_position();
             return Ok(());
         }
 
         let mut last_action_time = Instant::now();
-        let timeout = Duration::from_millis(500); // Timeout for considering input as invalid
+        let timeout = Duration::from_millis(500);
 
         loop {
             let lead = clock.lead_secs(*granule_position_ref);
@@ -117,26 +127,27 @@ impl StreamSession {
             match input_rx.try_recv() {
                 Ok(data) => {
                     last_action_time = Instant::now();
-                    let out = self.stream_processor.process(&data)?;
+                    let out = self
+                        .stream_processor
+                        .process(&data)
+                        .context("processing real audio chunk")?;
                     if !out.is_empty() {
-                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                            .await;
-                        if output_tx.send(out).await.is_err() {
-                            break;
-                        }
+                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+                        output_tx
+                            .send(out)
+                            .await
+                            .context("sending audio packet")?;
                     }
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Check if we've been waiting too long with no valid output
-                    // This could indicate invalid data that doesn't parse properly
                     if !self.stream_processor.has_produced_output()
                         && last_action_time.elapsed() > timeout
                     {
                         debug!("No valid output produced after timeout; breaking to restart with silence");
                         break;
                     }
-                    // Sleep for a fixed duration regardless of the lead value.
                     sleep(Duration::from_millis(10)).await;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -147,11 +158,16 @@ impl StreamSession {
             }
         }
 
-        let final_out = self.stream_processor.finalise()?;
+        let final_out = self
+            .stream_processor
+            .finalise()
+            .context("finalising real stream")?;
         if !final_out.is_empty() {
-            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                .await;
-            let _ = output_tx.send(final_out).await;
+            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+            output_tx
+                .send(final_out)
+                .await
+                .context("sending final audio packet")?;
         }
         *granule_position_ref = self.stream_processor.get_granule_position();
         Ok(())
@@ -159,11 +175,8 @@ impl StreamSession {
 
     /// Sleep if we're generating output faster than real-time
     async fn maybe_sleep(&self, clock: &StreamClock, buffered_seconds: f64, current_granule: u64) {
-        let lead = clock.lead_secs(current_granule);
-        if lead >= buffered_seconds {
-            while clock.lead_secs(current_granule) >= buffered_seconds {
-                sleep(Duration::from_millis(20)).await;
-            }
+        while clock.lead_secs(current_granule) >= buffered_seconds {
+            sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -183,18 +196,10 @@ pub struct OggMux {
 impl OggMux {
     /// Create a new OggMux with default configuration.
     pub fn new() -> Self {
-        let vorbis_config = VorbisConfig {
-            sample_rate: 44100,
-            bitrate: VorbisBitrateMode::CBR(320),
-        };
-
+        let vorbis_config = VorbisConfig { sample_rate: 44100, bitrate: VorbisBitrateMode::CBR(320) };
         let silence = Self::load_default_silence(&vorbis_config);
-
         Self {
-            buffer_config: BufferConfig {
-                buffered_seconds: 10.0,
-                max_chunk_size: 65536,
-            },
+            buffer_config: BufferConfig { buffered_seconds: 10.0, max_chunk_size: 65536 },
             vorbis_config,
             silence,
             initial_serial: 0xfeed_0000,
@@ -202,24 +207,6 @@ impl OggMux {
     }
 
     /// Configure buffer settings for the OggMux.
-    fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
-        match config.silence_key().as_str() {
-            "44100_192" => {
-                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
-            }
-            "44100_128" => {
-                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg"))
-            }
-            "44100_320" => {
-                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg"))
-            }
-            "48000_q6" => {
-                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg"))
-            }
-            _ => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg")),
-        }
-    }
-
     pub fn with_buffer_config(mut self, config: BufferConfig) -> Self {
         self.buffer_config = config;
         self
@@ -232,9 +219,21 @@ impl OggMux {
         self
     }
 
+    /// Override the silence template used for silence streams.
     pub fn with_silence_template(mut self, silence: SilenceTemplate) -> Self {
         self.silence = silence;
         self
+    }
+
+    /// Load the default embedded silence template based on the Vorbis config.
+    fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
+        match config.silence_key().as_str() {
+            "44100_192" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg")),
+            "44100_128" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg")),
+            "44100_320" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg")),
+            "48000_q6" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg")),
+            _ => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg")),
+        }
     }
 
     /// Generate a new serial number each time we spawn a stream.
@@ -249,98 +248,91 @@ impl OggMux {
     /// - Send real Ogg data into `input_tx`.
     /// - Muxed output arrives on `output_rx`.
     ///
-    /// The muxer automatically inserts silence when no input is available,
+    /// The muxer automatically inserts silence if input is idle,
+    /// and manages transitions between real audio and silence to maintain
+    /// proper timing.
+    /// Spawn the main muxer loop: returns (input_tx, output_rx).
+    ///
+    /// - Send real Ogg data into `input_tx`.
+    /// - Muxed output arrives on `output_rx`.
+    ///
+    /// The muxer automatically inserts silence if input is idle,
     /// and manages transitions between real audio and silence to maintain
     /// proper timing.
     pub fn spawn(mut self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
         let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
-
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
         let buffered_seconds = self.buffer_config.buffered_seconds;
-
-        let mut global_granule_position: u64 = 0;
+        let mut global_granule_position = 0u64;
 
         tokio::spawn(async move {
-            debug!("OggMux main loop started");
-
-            loop {
-                // Shutdown if output is closed
-                if output_tx.is_closed() {
-                    debug!("Output channel closed; exiting mux loop");
-                    break;
-                }
-
-                tokio::select! {
-                    maybe_input = input_rx.recv() => {
-                        match maybe_input {
-                            Some(first_chunk) => {
-                                let serial = self.next_serial();
-                                debug!("Starting REAL stream, serial=0x{:x}", serial);
-
-                                let mut session = StreamSession::new_real(serial, global_granule_position);
-
-                                match session.stream_processor.process(&first_chunk) {
-                                    Ok(out) => {
-                                        if !out.is_empty() && !output_tx.is_closed() {
-                                            session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
-                                            let _ = output_tx.send(out).await;
-                                        }
-                                        global_granule_position = session.stream_processor.get_granule_position();
-                                    }
-                                    Err(e) => {
-                                        error!("Error processing first chunk: {:?}", e);
-                                        continue;
-                                    }
-                                }
-
-                                if let Err(e) = session.run(
-                                    &mut input_rx,
-                                    &output_tx,
-                                    &clock,
-                                    buffered_seconds,
-                                    &mut global_granule_position
-                                ).await {
-                                    error!("Session run error: {:?}", e);
-                                }
-                            }
-                            None => {
-                                debug!("Input channel closed; exiting mux loop");
-                                break;
-                            }
-                        }
+            // Wrap in Result for `?`
+            let run_res: Result<()> = async {
+                debug!("OggMux main loop started");
+                loop {
+                    // Shutdown if output is closed
+                    if output_tx.is_closed() {
+                        debug!("Output channel closed; exiting mux loop");
+                        break;
                     }
 
-                    // Optional timeout to insert silence if input is idle
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        let serial = self.next_serial();
-                        debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
+                    tokio::select! {
+                        maybe_input = input_rx.recv() => {
+                            match maybe_input {
+                                Some(first_chunk) => {
+                                    let serial = self.next_serial();
+                                    debug!("Starting REAL stream, serial=0x{:x}", serial);
 
-                        let silence_data = self.silence.raw_bytes().to_vec().into();
-                        let mut session = StreamSession::new_silence(
-                            serial,
-                            global_granule_position,
-                            silence_data,
-                        );
+                                    let mut session = StreamSession::new_real(serial, global_granule_position);
 
-                        if let Err(e) = session.run(
-                            &mut input_rx,
-                            &output_tx,
-                            &clock,
-                            buffered_seconds,
-                            &mut global_granule_position
-                        ).await {
-                            error!("Silence session error: {:?}", e);
+                                    // Process first real chunk
+                                    let out = session.stream_processor.process(&first_chunk)
+                                        .context("processing initial real chunk")?;
+                                    if !out.is_empty() {
+                                        session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
+                                        output_tx.send(out).await.context("sending initial real chunk")?;
+                                    }
+                                    global_granule_position = session.stream_processor.get_granule_position();
+
+                                    // Continue session
+                                    session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position).await?;
+                                }
+                                None => {
+                                    debug!("Input channel closed; exiting mux loop");
+                                    break;
+                                }
+                            }
+                        }
+                        // Optional timeout to insert silence if input is idle
+                        _ = sleep(Duration::from_millis(100)) => {
+                            let serial = self.next_serial();
+                            debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
+
+                            let silence_data = self.silence.raw_bytes().to_vec().into();
+                            let mut session = StreamSession::new_silence(
+                                serial,
+                                global_granule_position,
+                                silence_data,
+                            );
+                            session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position).await?;
                         }
                     }
                 }
+                debug!("OggMux main loop ended");
+                Ok(())
             }
+            .await;
 
-            debug!("OggMux main loop ended");
+            if let Err(e) = run_res {
+                error!("OggMux task exited with error: {:?}", e);
+            }
         });
 
         (input_tx, output_rx)
     }
+
+    (input_tx, output_rx)
 }
 
 impl Default for OggMux {
@@ -352,30 +344,26 @@ impl Default for OggMux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use tokio::time::sleep;
+    use std::time::Duration;
 
     #[test]
     fn test_vorbis_config_silence_key_cbr() {
-        let cfg = VorbisConfig {
-            sample_rate: 44100,
-            bitrate: VorbisBitrateMode::CBR(192),
-        };
+        let cfg = VorbisConfig { sample_rate: 44100, bitrate: VorbisBitrateMode::CBR(192) };
         assert_eq!(cfg.silence_key(), "44100_192");
     }
 
     #[test]
     fn test_vorbis_config_silence_key_vbr() {
-        let cfg = VorbisConfig {
-            sample_rate: 48000,
-            bitrate: VorbisBitrateMode::VBRQuality(6),
-        };
+        let cfg = VorbisConfig { sample_rate: 48000, bitrate: VorbisBitrateMode::VBRQuality(6) };
         assert_eq!(cfg.silence_key(), "48000_q6");
     }
 
     #[test]
     fn test_default_mux_uses_expected_key() {
         let mux = OggMux::new();
-        let key = mux.vorbis_config.silence_key();
-        assert_eq!(key, "44100_320");
+        assert_eq!(mux.vorbis_config.silence_key(), "44100_320");
     }
 
     #[tokio::test]
