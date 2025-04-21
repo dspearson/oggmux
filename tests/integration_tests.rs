@@ -283,37 +283,24 @@ async fn test_invalid_ogg_data() -> Result<()> {
     // Push the invalid data
     tx.send(invalid_data).await?;
 
-    // Wait a bit longer to allow the timeout mechanism to trigger
-    sleep(Duration::from_millis(1000)).await;
+    // Wait a bit to allow muxer task to detect invalid input and shut down
+    sleep(Duration::from_millis(500)).await;
 
-    // We should still get silence output despite the invalid input
-    let mut received_packets = 0;
-    let start = Instant::now();
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 3 {
-            break;
+    // Now try to receive data; channel should be closed
+    match rx.recv().await {
+        Some(_) => panic!("Expected output channel to be closed after invalid input"),
+        None => {
+            // Channel is closed, which is expected
         }
     }
 
-    // We should have received at least one packet (silence generation)
+    // Also check sending more input fails
+    let result = tx.send(get_silence_ogg()).await;
     assert!(
-        received_packets > 0,
-        "No packets received after invalid input"
+        result.is_err(),
+        "Expected send to fail after muxer shutdown"
     );
 
-    // Close the channel
-    drop(tx);
     Ok(())
 }
 
@@ -466,8 +453,10 @@ async fn test_many_small_chunks() -> Result<()> {
     Ok(())
 }
 
-/// Test recovery after invalid data
-/// This test ensures the muxer can process valid data after receiving invalid data
+/// Test that the muxer aborts cleanly upon receiving invalid Ogg input.
+///
+/// After sending invalid data, the output channel should be closed,
+/// and further sends should fail. No packets should be received afterward.
 #[tokio::test]
 async fn test_recovery_after_invalid_data() -> Result<()> {
     let mux = create_test_mux();
@@ -477,40 +466,21 @@ async fn test_recovery_after_invalid_data() -> Result<()> {
     let invalid_data = Bytes::from(b"This is not a valid Ogg stream".to_vec());
     tx.send(invalid_data).await?;
 
-    // Wait for the timeout to trigger
-    sleep(Duration::from_millis(1000)).await;
+    // Wait for muxer shutdown
+    sleep(Duration::from_millis(500)).await;
 
-    // Now send valid Ogg data
-    tx.send(get_silence_ogg()).await?;
+    // Attempt to send valid Ogg data
+    let result = tx.send(get_silence_ogg()).await;
+    assert!(result.is_err(), "Expected send to fail after invalid input");
 
-    // Collect output to verify we receive valid Ogg pages
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut received_valid_data = false;
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                if contains_ogg_signatures(&packet) {
-                    received_valid_data = true;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 5 && received_valid_data {
-            break;
+    // Output channel should be closed
+    match rx.recv().await {
+        Some(_) => panic!("Expected output channel to be closed after invalid input"),
+        None => {
+            // Channel closed as expected
         }
     }
 
-    assert!(
-        received_valid_data,
-        "No valid Ogg data received after recovery"
-    );
-    assert!(received_packets > 0, "No packets received after recovery");
-
-    drop(tx);
     Ok(())
 }
 

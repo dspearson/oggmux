@@ -92,7 +92,8 @@ impl StreamSession {
                     .process(template)
                     .context("processing silence template")?;
                 if !out.is_empty() {
-                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                        .await;
                     output_tx
                         .send(out)
                         .await
@@ -105,7 +106,8 @@ impl StreamSession {
                 .finalise()
                 .context("finalising silence stream")?;
             if !final_out.is_empty() {
-                self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+                self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                    .await;
                 output_tx
                     .send(final_out)
                     .await
@@ -132,11 +134,9 @@ impl StreamSession {
                         .process(&data)
                         .context("processing real audio chunk")?;
                     if !out.is_empty() {
-                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
-                        output_tx
-                            .send(out)
-                            .await
-                            .context("sending audio packet")?;
+                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                            .await;
+                        output_tx.send(out).await.context("sending audio packet")?;
                     }
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
@@ -163,7 +163,8 @@ impl StreamSession {
             .finalise()
             .context("finalising real stream")?;
         if !final_out.is_empty() {
-            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref).await;
+            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                .await;
             output_tx
                 .send(final_out)
                 .await
@@ -196,10 +197,16 @@ pub struct OggMux {
 impl OggMux {
     /// Create a new OggMux with default configuration.
     pub fn new() -> Self {
-        let vorbis_config = VorbisConfig { sample_rate: 44100, bitrate: VorbisBitrateMode::CBR(320) };
+        let vorbis_config = VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::CBR(320),
+        };
         let silence = Self::load_default_silence(&vorbis_config);
         Self {
-            buffer_config: BufferConfig { buffered_seconds: 10.0, max_chunk_size: 65536 },
+            buffer_config: BufferConfig {
+                buffered_seconds: 10.0,
+                max_chunk_size: 65536,
+            },
             vorbis_config,
             silence,
             initial_serial: 0xfeed_0000,
@@ -228,10 +235,18 @@ impl OggMux {
     /// Load the default embedded silence template based on the Vorbis config.
     fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
         match config.silence_key().as_str() {
-            "44100_192" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg")),
-            "44100_128" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg")),
-            "44100_320" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg")),
-            "48000_q6" => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg")),
+            "44100_192" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
+            }
+            "44100_128" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg"))
+            }
+            "44100_320" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg"))
+            }
+            "48000_q6" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg"))
+            }
             _ => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg")),
         }
     }
@@ -331,8 +346,6 @@ impl OggMux {
 
         (input_tx, output_rx)
     }
-
-    (input_tx, output_rx)
 }
 
 impl Default for OggMux {
@@ -345,18 +358,24 @@ impl Default for OggMux {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use tokio::time::sleep;
     use std::time::Duration;
+    use tokio::time::sleep;
 
     #[test]
     fn test_vorbis_config_silence_key_cbr() {
-        let cfg = VorbisConfig { sample_rate: 44100, bitrate: VorbisBitrateMode::CBR(192) };
+        let cfg = VorbisConfig {
+            sample_rate: 44100,
+            bitrate: VorbisBitrateMode::CBR(192),
+        };
         assert_eq!(cfg.silence_key(), "44100_192");
     }
 
     #[test]
     fn test_vorbis_config_silence_key_vbr() {
-        let cfg = VorbisConfig { sample_rate: 48000, bitrate: VorbisBitrateMode::VBRQuality(6) };
+        let cfg = VorbisConfig {
+            sample_rate: 48000,
+            bitrate: VorbisBitrateMode::VBRQuality(6),
+        };
         assert_eq!(cfg.silence_key(), "48000_q6");
     }
 
