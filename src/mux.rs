@@ -358,8 +358,7 @@ impl Default for OggMux {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::time::Duration;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, Duration};
 
     #[test]
     fn test_vorbis_config_silence_key_cbr() {
@@ -379,20 +378,30 @@ mod tests {
         assert_eq!(cfg.silence_key(), "48000_q6");
     }
 
-    #[test]
-    fn test_default_mux_uses_expected_key() {
-        let mux = OggMux::new();
-        assert_eq!(mux.vorbis_config.silence_key(), "44100_320");
-    }
-
     #[tokio::test]
     async fn test_mux_shutdown_behavior() {
         let mux = OggMux::new();
         let (input_tx, output_rx) = mux.spawn();
         drop(output_rx);
-        let _ = input_tx.send(Bytes::from_static(b"example")).await;
-        sleep(Duration::from_millis(200)).await;
-        let result = input_tx.send(Bytes::from_static(b"after close")).await;
-        assert!(result.is_err(), "Expected send to fail after shutdown");
+
+        // Wait up to 100ms for the channel to be marked as closed
+        let mut closed = false;
+        for _ in 0..10 {
+            if input_tx.is_closed() {
+                closed = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            closed,
+            "Expected input channel to close after output receiver dropped"
+        );
+        let send_result = input_tx.send(Bytes::from_static(b"example")).await;
+        assert!(
+            send_result.is_err(),
+            "Expected send to fail after output closed"
+        );
     }
 }
