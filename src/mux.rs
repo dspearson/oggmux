@@ -4,6 +4,7 @@ use log::{debug, error};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
+use crate::metrics::MetricsCollector;
 
 use crate::silence::SilenceTemplate;
 use crate::stream::StreamProcessor;
@@ -84,6 +85,7 @@ impl StreamSession {
         clock: &StreamClock,
         buffered_seconds: f64,
         granule_position_ref: &mut u64,
+        metrics_collector: Option<MetricsCollector>,
     ) -> Result<()> {
         if self.is_silence {
             if let Some(ref template) = self.silence_template {
@@ -95,9 +97,15 @@ impl StreamSession {
                     self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                         .await;
                     output_tx
-                        .send(out)
+                        .send(out.clone())
                         .await
                         .context("sending silence packet")?;
+                        
+                    // Record output bytes in metrics
+                    if let Some(ref mc) = metrics_collector {
+                        mc.add_bytes_processed(out.len()).await;
+                    }
+                    
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
             }
@@ -109,9 +117,14 @@ impl StreamSession {
                 self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                     .await;
                 output_tx
-                    .send(final_out)
+                    .send(final_out.clone())
                     .await
                     .context("sending final silence packet")?;
+                    
+                // Record output bytes in metrics
+                if let Some(ref mc) = metrics_collector {
+                    mc.add_bytes_processed(final_out.len()).await;
+                }
             }
             *granule_position_ref = self.stream_processor.get_granule_position();
             return Ok(());
@@ -129,16 +142,37 @@ impl StreamSession {
             match input_rx.try_recv() {
                 Ok(data) => {
                     last_action_time = Instant::now();
+                    // Track processing time for metrics
+                    let process_start = Instant::now();
                     let out = self
                         .stream_processor
                         .process(&data)
                         .context("processing real audio chunk")?;
+                        
+                    // Record processing latency in metrics
+                    if let Some(ref mc) = &metrics_collector {
+                        let latency = process_start.elapsed().as_secs_f64() * 1000.0;
+                        mc.record_processing_latency(latency).await;
+                    }
+                    
                     if !out.is_empty() {
                         self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                             .await;
-                        output_tx.send(out).await.context("sending audio packet")?;
+                        output_tx.send(out.clone()).await.context("sending audio packet")?;
+                        
+                        // Record output bytes in metrics
+                        if let Some(ref mc) = &metrics_collector {
+                            mc.add_bytes_processed(out.len()).await;
+                        }
                     }
                     *granule_position_ref = self.stream_processor.get_granule_position();
+                    
+                    // Record buffer utilization
+                    if let Some(ref mc) = &metrics_collector {
+                        let lead = clock.lead_secs(*granule_position_ref);
+                        let utilization = (lead / buffered_seconds) * 100.0;
+                        mc.record_buffer_utilization(utilization).await;
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Check if we've been waiting too long with no valid output
@@ -166,9 +200,14 @@ impl StreamSession {
             self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                 .await;
             output_tx
-                .send(final_out)
+                .send(final_out.clone())
                 .await
                 .context("sending final audio packet")?;
+                
+            // Record output bytes in metrics  
+            if let Some(ref mc) = &metrics_collector {
+                mc.add_bytes_processed(final_out.len()).await;
+            }
         }
         *granule_position_ref = self.stream_processor.get_granule_position();
         Ok(())
@@ -192,6 +231,7 @@ pub struct OggMux {
     vorbis_config: VorbisConfig,
     silence: SilenceTemplate,
     initial_serial: u32,
+    metrics_collector: Option<crate::metrics::MetricsCollector>,
 }
 
 impl OggMux {
@@ -210,6 +250,7 @@ impl OggMux {
             vorbis_config,
             silence,
             initial_serial: 0xfeed_0000,
+            metrics_collector: None,
         }
     }
 
@@ -230,6 +271,23 @@ impl OggMux {
     pub fn with_silence_template(mut self, silence: SilenceTemplate) -> Self {
         self.silence = silence;
         self
+    }
+    
+    /// Add metrics collection to the OggMux.
+    ///
+    /// Enables collecting performance metrics such as buffer utilization,
+    /// latency, and silence insertion statistics.
+    pub fn with_metrics(mut self) -> Self {
+        self.metrics_collector = Some(crate::metrics::MetricsCollector::new());
+        self
+    }
+    
+    /// Get access to the metrics collector, if enabled.
+    ///
+    /// Returns the metrics collector instance if it was enabled
+    /// with `with_metrics()`, or None if metrics collection is disabled.
+    pub fn metrics(&self) -> Option<crate::metrics::MetricsCollector> {
+        self.metrics_collector.clone()
     }
 
     /// Load the default embedded silence template based on the Vorbis config.
@@ -280,6 +338,7 @@ impl OggMux {
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
         let buffered_seconds = self.buffer_config.buffered_seconds;
         let mut global_granule_position = 0u64;
+        let metrics_collector = self.metrics_collector.clone();
 
         tokio::spawn(async move {
             // Wrap in Result for `?`
@@ -300,18 +359,36 @@ impl OggMux {
                                     debug!("Starting REAL stream, serial=0x{:x}", serial);
 
                                     let mut session = StreamSession::new_real(serial, global_granule_position);
+                                    
+                                    // Record real stream in metrics
+                                    if let Some(ref mc) = metrics_collector {
+                                        mc.increment_real_streams().await;
+                                    }
 
                                     // Process first real chunk
+                                    let process_start = Instant::now();
                                     let out = session.stream_processor.process(&first_chunk)
                                         .context("processing initial real chunk")?;
+                                        
+                                    // Record processing latency
+                                    if let Some(ref mc) = metrics_collector {
+                                        let latency = process_start.elapsed().as_secs_f64() * 1000.0;
+                                        mc.record_processing_latency(latency).await;
+                                    }
+                                    
                                     if !out.is_empty() {
                                         session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
-                                        output_tx.send(out).await.context("sending initial real chunk")?;
+                                        output_tx.send(out.clone()).await.context("sending initial real chunk")?;
+                                        
+                                        // Record output bytes
+                                        if let Some(ref mc) = metrics_collector {
+                                            mc.add_bytes_processed(out.len()).await;
+                                        }
                                     }
                                     global_granule_position = session.stream_processor.get_granule_position();
 
                                     // Continue session
-                                    session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position).await?;
+                                    session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
                                 }
                                 None => {
                                     debug!("Input channel closed; exiting mux loop");
@@ -324,13 +401,19 @@ impl OggMux {
                             let serial = self.next_serial();
                             debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
 
-                            let silence_data = self.silence.raw_bytes().to_vec().into();
+                            let silence_data: Bytes = self.silence.raw_bytes().to_vec().into();
                             let mut session = StreamSession::new_silence(
                                 serial,
                                 global_granule_position,
-                                silence_data,
+                                silence_data.clone(),
                             );
-                            session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position).await?;
+                            
+                            // Record silence insertion in metrics
+                            if let Some(ref mc) = metrics_collector {
+                                mc.add_silence_bytes(silence_data.len()).await;
+                            }
+                            
+                            session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
                         }
                     }
                 }

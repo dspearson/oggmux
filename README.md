@@ -10,6 +10,8 @@ A Rust library for muxing Ogg streams with clean silence gaps, suitable for stre
 - **Buffering**: Configurable buffering to handle network jitter
 - **Async-first**: Built with Tokio for high-performance asynchronous operation
 - **Robust error handling**: Uses anyhow for rich error context and graceful recovery
+- **Helper utilities**: Functions for calculating optimal buffer sizes based on bitrate and latency requirements
+- **Stream metrics**: Collection and monitoring of stream health statistics
 
 ### Basic Example
 
@@ -95,6 +97,65 @@ This approach is ideal for applications where a continuous stream must be mainta
 
 - Rust 2021 edition or later
 - Tokio runtime
+
+## Utility Functions
+
+OggMux provides helper functions for calculating optimal buffer sizes:
+
+```rust
+use oggmux::{calculate_buffer_size, calculate_buffered_seconds};
+
+// Calculate ideal buffer size based on bitrate and target latency
+let buffer_size = calculate_buffer_size(192, 500); // 192kbps, 500ms latency -> 16384 bytes
+
+// Calculate how many seconds of audio a buffer can hold
+let seconds = calculate_buffered_seconds(192, 16384); // ~0.68 seconds at 192kbps
+```
+
+These utilities help you configure your streaming application for optimal performance.
+
+## Stream Metrics
+
+OggMux can collect metrics about the streaming process, which is helpful for monitoring and debugging:
+
+```rust
+use oggmux::{OggMux, MetricsCollector};
+
+// Enable metrics collection
+let mux = OggMux::new().with_metrics();
+
+// Spawn the muxer
+let (input_tx, output_rx) = mux.spawn();
+
+// Get the metrics collector
+if let Some(metrics) = mux.metrics() {
+    // Later, retrieve metrics:
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            
+            // Get a snapshot of current metrics
+            let snapshot = metrics.snapshot().await;
+            
+            println!("Stream stats:");
+            println!("  Bytes processed: {}", snapshot.bytes_processed);
+            println!("  Silence insertions: {}", snapshot.silence_insertions);
+            println!("  Silence percentage: {:.1}%", snapshot.silence_percentage());
+            println!("  Buffer utilization: {:.1}%", snapshot.buffer_utilization.last);
+            println!("  Processing latency: {:.2}ms avg, {:.2}ms max", 
+                     snapshot.processing_latency_ms.avg,
+                     snapshot.processing_latency_ms.max);
+        }
+    });
+}
+```
+
+Available metrics include:
+- Bytes processed and silence inserted
+- Number of silence insertions and real streams
+- Buffer utilization percentage
+- Processing latency statistics
+- Uptime and stream health indicators
 
 ## Limitations
 

@@ -1,6 +1,6 @@
 [package]
 name = "oggmux"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Dominic Pearson <dsp@technoanimal.net>"]
 edition = "2021"
 license = "ISC"
@@ -10,9 +10,9 @@ repository = "https://github.com/dspearson/oggmux"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1.0.97"
+anyhow = "1.0.98"
 bytes = "1.10.1"
 log = "0.4.27"
 ogg = "0.9.2"
 ogg_pager = "0.7.0"
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.45.0", features = ["full"] }
