@@ -20,6 +20,27 @@ pub struct BufferConfig {
     pub max_chunk_size: usize,
 }
 
+impl BufferConfig {
+    /// Validate the buffer configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configuration values are invalid:
+    /// - `buffered_seconds` must be positive
+    /// - `max_chunk_size` must be non-zero
+    fn validate(&self) {
+        assert!(
+            self.buffered_seconds > 0.0,
+            "BufferConfig: buffered_seconds must be positive, got {}",
+            self.buffered_seconds
+        );
+        assert!(
+            self.max_chunk_size > 0,
+            "BufferConfig: max_chunk_size must be non-zero"
+        );
+    }
+}
+
 /// Bitrate mode for Vorbis encoding or template selection
 #[derive(Clone, Copy, Debug)]
 pub enum VorbisBitrateMode {
@@ -44,6 +65,32 @@ impl VorbisConfig {
         match self.bitrate {
             VorbisBitrateMode::CBR(kbps) => format!("{}_{}", self.sample_rate, kbps),
             VorbisBitrateMode::VBRQuality(q) => format!("{}_q{}", self.sample_rate, q),
+        }
+    }
+
+    /// Validate the Vorbis configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configuration values are invalid:
+    /// - `sample_rate` must be non-zero (would cause division by zero in timing calculations)
+    /// - For CBR mode, bitrate must be non-zero
+    fn validate(&self) {
+        assert!(
+            self.sample_rate > 0,
+            "VorbisConfig: sample_rate must be non-zero, got {}",
+            self.sample_rate
+        );
+        match self.bitrate {
+            VorbisBitrateMode::CBR(kbps) => {
+                assert!(
+                    kbps > 0,
+                    "VorbisConfig: CBR bitrate must be non-zero"
+                );
+            }
+            VorbisBitrateMode::VBRQuality(_) => {
+                // Quality levels 0-10 are all valid
+            }
         }
     }
 }
@@ -255,13 +302,25 @@ impl OggMux {
     }
 
     /// Configure buffer settings for the OggMux.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration is invalid (e.g., non-positive buffered_seconds,
+    /// zero max_chunk_size).
     pub fn with_buffer_config(mut self, config: BufferConfig) -> Self {
+        config.validate();
         self.buffer_config = config;
         self
     }
 
     /// Configure Vorbis audio parameters for the OggMux.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration is invalid (e.g., zero sample_rate which would
+    /// cause division by zero in timing calculations, zero CBR bitrate).
     pub fn with_vorbis_config(mut self, config: VorbisConfig) -> Self {
+        config.validate();
         self.vorbis_config = config;
         self.silence = Self::load_default_silence(&self.vorbis_config);
         self
