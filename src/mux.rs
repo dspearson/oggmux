@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
@@ -188,7 +188,7 @@ impl StreamSession {
         }
 
         let mut last_action_time = Instant::now();
-        let timeout = Duration::from_millis(500);
+        let input_timeout = Duration::from_millis(500);
 
         loop {
             let lead = clock.lead_secs(*granule_position_ref);
@@ -240,7 +240,7 @@ impl StreamSession {
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Check if we've been waiting too long with no valid output
                     if !self.stream_processor.has_produced_output()
-                        && last_action_time.elapsed() > timeout
+                        && last_action_time.elapsed() > input_timeout
                     {
                         debug!("No valid output produced after timeout; breaking to restart with silence");
                         break;
@@ -557,8 +557,7 @@ impl Default for OggMux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::Duration;
 
     #[test]
     fn test_vorbis_config_silence_key_cbr() {
