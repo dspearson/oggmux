@@ -382,23 +382,55 @@ impl OggMux {
         s
     }
 
-    /// Spawn the main muxer loop: returns (input_tx, output_rx).
+    /// Spawn the main muxer loop.
     ///
-    /// - Send real Ogg data into `input_tx`.
-    /// - Muxed output arrives on `output_rx`.
+    /// Returns `(input_tx, output_rx, shutdown_tx, handle)` where:
+    /// - `input_tx`: Send real Ogg data chunks to be muxed
+    /// - `output_rx`: Receive muxed output (real audio + silence as needed)
+    /// - `shutdown_tx`: Send `()` to gracefully shut down the muxer
+    /// - `handle`: JoinHandle to await task completion and detect errors
     ///
     /// The muxer automatically inserts silence if input is idle,
     /// and manages transitions between real audio and silence to maintain
     /// proper timing.
-    pub fn spawn(mut self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+    ///
+    /// # Graceful Shutdown
+    ///
+    /// To shut down cleanly:
+    /// ```no_run
+    /// # use oggmux::OggMux;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let (input_tx, output_rx, shutdown_tx, handle) = OggMux::new().spawn();
+    ///
+    /// // ... use the muxer ...
+    ///
+    /// // Signal shutdown
+    /// let _ = shutdown_tx.send(()).await;
+    ///
+    /// // Wait for clean exit
+    /// match handle.await {
+    ///     Ok(Ok(())) => println!("Muxer exited cleanly"),
+    ///     Ok(Err(e)) => eprintln!("Muxer error: {:?}", e),
+    ///     Err(e) => eprintln!("Task panicked: {:?}", e),
+    /// }
+    /// # }
+    /// ```
+    pub fn spawn(mut self) -> (
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<Bytes>,
+        mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.channel_capacity);
         let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.channel_capacity);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
         let buffered_seconds = self.buffer_config.buffered_seconds;
         let mut global_granule_position = 0u64;
         let metrics_collector = self.metrics_collector.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Wrap in Result for `?`
             let run_res: Result<()> = async {
                 debug!("OggMux main loop started");
@@ -410,6 +442,10 @@ impl OggMux {
                     }
 
                     tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            debug!("Shutdown signal received; exiting mux loop");
+                            break;
+                        }
                         maybe_input = input_rx.recv() => {
                             match maybe_input {
                                 Some(first_chunk) => {
@@ -480,12 +516,10 @@ impl OggMux {
             }
             .await;
 
-            if let Err(e) = run_res {
-                error!("OggMux task exited with error: {:?}", e);
-            }
+            run_res
         });
 
-        (input_tx, output_rx)
+        (input_tx, output_rx, shutdown_tx, handle)
     }
 }
 
@@ -522,27 +556,27 @@ mod tests {
     #[tokio::test]
     async fn test_mux_shutdown_behavior() {
         let mux = OggMux::new();
-        let (input_tx, output_rx) = mux.spawn();
+        let (_input_tx, output_rx, _shutdown_tx, handle) = mux.spawn();
         drop(output_rx);
 
-        // Wait up to 100ms for the channel to be marked as closed
-        let mut closed = false;
-        for _ in 0..10 {
-            if input_tx.is_closed() {
-                closed = true;
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
+        // Task should exit cleanly when output is dropped
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok(), "Task should exit when output dropped");
+        assert!(result.unwrap().is_ok(), "Task should not panic");
+    }
 
-        assert!(
-            closed,
-            "Expected input channel to close after output receiver dropped"
-        );
-        let send_result = input_tx.send(Bytes::from_static(b"example")).await;
-        assert!(
-            send_result.is_err(),
-            "Expected send to fail after output closed"
-        );
+    #[tokio::test]
+    async fn test_mux_graceful_shutdown() {
+        let mux = OggMux::new();
+        let (_input_tx, _output_rx, shutdown_tx, handle) = mux.spawn();
+
+        // Signal shutdown
+        shutdown_tx.send(()).await.expect("Failed to send shutdown signal");
+
+        // Task should exit cleanly
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok(), "Task should exit on shutdown signal");
+        let task_result = result.unwrap().expect("Task should not panic");
+        assert!(task_result.is_ok(), "Task should exit without error");
     }
 }

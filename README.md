@@ -22,7 +22,7 @@ use tokio::time::sleep;
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     // Create a new OggMux with custom configuration
     let mux = OggMux::new()
         .with_buffer_config(BufferConfig {
@@ -35,17 +35,27 @@ async fn main() {
         });
 
     // Spawn the muxer and get the channels
-    let (input_tx, mut output_rx) = mux.spawn();
+    let (input_tx, mut output_rx, shutdown_tx, handle) = mux.spawn();
 
     // Feed some data (e.g., from a file or network stream)
     let ogg_data = Bytes::from_static(&[/* Ogg data here */]);
     let _ = input_tx.send(ogg_data).await;
 
     // Read the processed output (e.g., send to Icecast)
-    while let Some(output) = output_rx.recv().await {
-        // Send output to your streaming destination
-        println!("Got {} bytes of muxed output", output.len());
-    }
+    tokio::spawn(async move {
+        while let Some(output) = output_rx.recv().await {
+            // Send output to your streaming destination
+            println!("Got {} bytes of muxed output", output.len());
+        }
+    });
+
+    // ... do work ...
+
+    // Gracefully shut down when done
+    let _ = shutdown_tx.send(()).await;
+    handle.await??;  // Wait for clean exit and check for errors
+
+    Ok(())
 }
 ```
 
@@ -124,11 +134,14 @@ use oggmux::{OggMux, MetricsCollector};
 // Enable metrics collection
 let mux = OggMux::new().with_metrics();
 
-// Spawn the muxer
-let (input_tx, output_rx) = mux.spawn();
+// Get the metrics collector before spawning
+let metrics = mux.metrics();
 
-// Get the metrics collector
-if let Some(metrics) = mux.metrics() {
+// Spawn the muxer
+let (input_tx, output_rx, shutdown_tx, handle) = mux.spawn();
+
+// Use the metrics collector
+if let Some(metrics) = metrics {
     // Later, retrieve metrics:
     tokio::spawn(async move {
         loop {

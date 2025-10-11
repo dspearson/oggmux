@@ -26,7 +26,7 @@ fn contains_ogg_signatures(data: &[u8]) -> bool {
 #[tokio::test]
 async fn test_silence_generation() -> Result<()> {
     let mux = create_test_mux();
-    let (_tx, mut rx) = mux.spawn();
+    let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     sleep(Duration::from_millis(200)).await;
 
@@ -42,7 +42,7 @@ async fn test_silence_generation() -> Result<()> {
 #[tokio::test]
 async fn test_mux_with_valid_ogg_data() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     tx.send(get_silence_ogg()).await?;
 
@@ -59,7 +59,7 @@ async fn test_mux_with_valid_ogg_data() -> Result<()> {
 async fn test_invalid_data_handling() -> Result<()> {
     let invalid_data = Bytes::from(b"invalid data".to_vec());
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     tx.send(invalid_data).await?;
 
@@ -79,7 +79,7 @@ async fn test_truncated_ogg_data() -> Result<()> {
     truncated.truncate(truncated.len() / 2);
 
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     tx.send(Bytes::from(truncated)).await?;
 
@@ -95,7 +95,7 @@ async fn test_truncated_ogg_data() -> Result<()> {
 #[tokio::test]
 async fn test_multiple_data_pushes() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     for _ in 0..3 {
         tx.send(get_silence_ogg()).await?;
@@ -124,7 +124,7 @@ async fn test_multiple_data_pushes() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_producers() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     let tx1 = tx.clone();
     let producer1 = tokio::spawn(async move {
