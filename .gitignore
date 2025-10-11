@@ -1,1 +1,25 @@
+# Rust build artifacts
 /target
+
+# Claude Code tracking
+CLAUDE.md
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.orig
+
+# Test artifacts
+*.profraw
+*.profdata
