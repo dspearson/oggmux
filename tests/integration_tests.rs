@@ -7,7 +7,7 @@ fn create_test_mux() -> OggMux {
     OggMux::new()
         .with_buffer_config(BufferConfig {
             buffered_seconds: 0.5,
-            max_chunk_size: 4096,
+            channel_capacity: 4096,
         })
         .with_vorbis_config(VorbisConfig {
             sample_rate: 44100,

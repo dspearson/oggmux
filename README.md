@@ -27,7 +27,7 @@ async fn main() {
     let mux = OggMux::new()
         .with_buffer_config(BufferConfig {
             buffered_seconds: 10.0,
-            max_chunk_size: 4096,
+            channel_capacity: 4096,
         })
         .with_vorbis_config(VorbisConfig {
             sample_rate: 44100,
@@ -55,8 +55,8 @@ async fn main() {
 
 ```rust
 BufferConfig {
-    buffered_seconds: 10.0, // Target amount of audio to keep buffered
-    max_chunk_size: 65536,  // Maximum chunk size to process at once
+    buffered_seconds: 10.0,    // Target amount of audio to keep buffered
+    channel_capacity: 65536,   // Maximum number of chunks buffered in channel
 }
 ```
 

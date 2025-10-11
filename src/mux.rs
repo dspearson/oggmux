@@ -16,8 +16,8 @@ pub struct BufferConfig {
     /// Target amount of audio to keep buffered (in seconds)
     pub buffered_seconds: f64,
 
-    /// Maximum number of buffered chunks in the channel
-    pub max_chunk_size: usize,
+    /// Maximum number of chunks that can be buffered in the channel
+    pub channel_capacity: usize,
 }
 
 impl BufferConfig {
@@ -27,7 +27,7 @@ impl BufferConfig {
     ///
     /// Panics if configuration values are invalid:
     /// - `buffered_seconds` must be positive
-    /// - `max_chunk_size` must be non-zero
+    /// - `channel_capacity` must be non-zero
     fn validate(&self) {
         assert!(
             self.buffered_seconds > 0.0,
@@ -35,8 +35,8 @@ impl BufferConfig {
             self.buffered_seconds
         );
         assert!(
-            self.max_chunk_size > 0,
-            "BufferConfig: max_chunk_size must be non-zero"
+            self.channel_capacity > 0,
+            "BufferConfig: channel_capacity must be non-zero"
         );
     }
 }
@@ -292,7 +292,7 @@ impl OggMux {
         Self {
             buffer_config: BufferConfig {
                 buffered_seconds: 10.0,
-                max_chunk_size: 65536,
+                channel_capacity: 65536,
             },
             vorbis_config,
             silence,
@@ -306,7 +306,7 @@ impl OggMux {
     /// # Panics
     ///
     /// Panics if the configuration is invalid (e.g., non-positive buffered_seconds,
-    /// zero max_chunk_size).
+    /// zero channel_capacity).
     pub fn with_buffer_config(mut self, config: BufferConfig) -> Self {
         config.validate();
         self.buffer_config = config;
@@ -391,8 +391,8 @@ impl OggMux {
     /// and manages transitions between real audio and silence to maintain
     /// proper timing.
     pub fn spawn(mut self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
-        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
-        let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.channel_capacity);
+        let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.channel_capacity);
         let clock = StreamClock::new(self.vorbis_config.sample_rate);
         let buffered_seconds = self.buffer_config.buffered_seconds;
         let mut global_granule_position = 0u64;
