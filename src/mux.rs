@@ -3,12 +3,15 @@ use bytes::Bytes;
 use log::{debug, error, warn};
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use crate::metrics::MetricsCollector;
 
 use crate::silence::SilenceTemplate;
 use crate::stream::StreamProcessor;
 use crate::timing::StreamClock;
+
+/// Timeout for output sends - prevents indefinite blocking if consumer is slow
+const OUTPUT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for buffer management.
 #[derive(Clone, Copy)]
@@ -143,11 +146,15 @@ impl StreamSession {
                 if !out.is_empty() {
                     self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                         .await;
-                    output_tx
-                        .send(out.clone())
-                        .await
-                        .context("sending silence packet")?;
-                        
+                    match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                        Err(_) => {
+                            warn!("Output send timeout - consumer too slow, dropping packet");
+                            // Continue processing despite timeout
+                        }
+                    }
+
                     // Record output bytes in metrics
                     if let Some(ref mc) = metrics_collector {
                         mc.add_bytes_processed(out.len()).await;
@@ -163,11 +170,14 @@ impl StreamSession {
             if !final_out.is_empty() {
                 self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                     .await;
-                output_tx
-                    .send(final_out.clone())
-                    .await
-                    .context("sending final silence packet")?;
-                    
+                match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                    Err(_) => {
+                        warn!("Output send timeout - consumer too slow, dropping final silence packet");
+                    }
+                }
+
                 // Record output bytes in metrics
                 if let Some(ref mc) = metrics_collector {
                     mc.add_bytes_processed(final_out.len()).await;
@@ -205,8 +215,14 @@ impl StreamSession {
                     if !out.is_empty() {
                         self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                             .await;
-                        output_tx.send(out.clone()).await.context("sending audio packet")?;
-                        
+                        match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                            Err(_) => {
+                                warn!("Output send timeout - consumer too slow, dropping real audio packet");
+                            }
+                        }
+
                         // Record output bytes in metrics
                         if let Some(ref mc) = &metrics_collector {
                             mc.add_bytes_processed(out.len()).await;
@@ -246,12 +262,15 @@ impl StreamSession {
         if !final_out.is_empty() {
             self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                 .await;
-            output_tx
-                .send(final_out.clone())
-                .await
-                .context("sending final audio packet")?;
-                
-            // Record output bytes in metrics  
+            match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                Err(_) => {
+                    warn!("Output send timeout - consumer too slow, dropping final real audio packet");
+                }
+            }
+
+            // Record output bytes in metrics
             if let Some(ref mc) = &metrics_collector {
                 mc.add_bytes_processed(final_out.len()).await;
             }
@@ -472,8 +491,14 @@ impl OggMux {
                                     
                                     if !out.is_empty() {
                                         session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
-                                        output_tx.send(out.clone()).await.context("sending initial real chunk")?;
-                                        
+                                        match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
+                                            Ok(Ok(())) => {},
+                                            Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                                            Err(_) => {
+                                                warn!("Output send timeout - consumer too slow, dropping initial real audio packet");
+                                            }
+                                        }
+
                                         // Record output bytes
                                         if let Some(ref mc) = metrics_collector {
                                             mc.add_bytes_processed(out.len()).await;
