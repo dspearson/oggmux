@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
@@ -351,7 +351,8 @@ impl OggMux {
 
     /// Load the default embedded silence template based on the Vorbis config.
     fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
-        match config.silence_key().as_str() {
+        let key = config.silence_key();
+        match key.as_str() {
             "44100_192" => {
                 SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
             }
@@ -364,7 +365,13 @@ impl OggMux {
             "48000_q6" => {
                 SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg"))
             }
-            _ => SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg")),
+            _ => {
+                warn!(
+                    "No silence template for config '{}' (sample_rate={}, bitrate={:?}), using default (44100_320)",
+                    key, config.sample_rate, config.bitrate
+                );
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_default.ogg"))
+            }
         }
     }
 
