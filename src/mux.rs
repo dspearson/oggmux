@@ -383,14 +383,6 @@ impl OggMux {
     /// The muxer automatically inserts silence if input is idle,
     /// and manages transitions between real audio and silence to maintain
     /// proper timing.
-    /// Spawn the main muxer loop: returns (input_tx, output_rx).
-    ///
-    /// - Send real Ogg data into `input_tx`.
-    /// - Muxed output arrives on `output_rx`.
-    ///
-    /// The muxer automatically inserts silence if input is idle,
-    /// and manages transitions between real audio and silence to maintain
-    /// proper timing.
     pub fn spawn(mut self) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
         let (output_tx, output_rx) = mpsc::channel::<Bytes>(self.buffer_config.max_chunk_size);
