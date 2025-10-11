@@ -13,7 +13,7 @@
 //! use bytes::Bytes;
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> anyhow::Result<()> {
 //!     // Create a new OggMux with custom configuration
 //!     let mux = OggMux::new().with_vorbis_config(VorbisConfig {
 //!         sample_rate: 44100,
@@ -21,7 +21,7 @@
 //!     });
 //!
 //!     // Spawn the muxer and get the channels
-//!     let (input_tx, mut output_rx) = mux.spawn();
+//!     let (input_tx, mut output_rx, shutdown_tx, handle) = mux.spawn();
 //!
 //!     // Feed some Ogg data (e.g., from a file or network stream)
 //!     let ogg_data = Bytes::from_static(&[/* Ogg data here */]);
@@ -31,6 +31,11 @@
 //!     while let Some(output) = output_rx.recv().await {
 //!         println!("Got {} bytes of output", output.len());
 //!     }
+//!
+//!     // Gracefully shut down
+//!     let _ = shutdown_tx.send(()).await;
+//!     handle.await??;
+//!     Ok(())
 //! }
 //! ```
 
@@ -38,6 +43,11 @@ mod mux;
 mod silence;
 mod stream;
 mod timing;
+mod comments;
+pub mod utils;
+pub mod metrics;
 
 // Re-export public API
-pub use mux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig};
+pub use mux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig, MuxMode, MetadataCallback};
+pub use utils::{calculate_buffer_size, calculate_buffered_seconds};
+pub use metrics::{MetricsCollector, StreamMetrics, MetricStats};

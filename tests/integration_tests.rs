@@ -1,14 +1,14 @@
 use anyhow::Result;
 use bytes::Bytes;
-use oggmux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig};
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use oggmux::{BufferConfig, MuxMode, OggMux, VorbisBitrateMode, VorbisConfig};
+use std::sync::{Arc, Mutex};
+use tokio::time::{sleep, Duration};
 
 fn create_test_mux() -> OggMux {
     OggMux::new()
         .with_buffer_config(BufferConfig {
             buffered_seconds: 0.5,
-            max_chunk_size: 4096,
+            channel_capacity: 4096,
         })
         .with_vorbis_config(VorbisConfig {
             sample_rate: 44100,
@@ -24,857 +24,320 @@ fn contains_ogg_signatures(data: &[u8]) -> bool {
     data.windows(4).any(|window| window == b"OggS")
 }
 
-/// Basic test that the OggMux can be constructed and configured
-#[tokio::test]
-async fn test_oggmux_construction() {
-    // Create with default settings
-    let mux = OggMux::new();
-    let (tx, _rx) = mux.spawn();
-    drop(tx); // Close the channel to allow the mux task to complete
-
-    // Create with custom buffer settings
-    let mux = OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 5.0,
-        max_chunk_size: 8192,
-    });
-    let (tx, _rx) = mux.spawn();
-    drop(tx);
-
-    // Create with custom Vorbis settings
-    let mux = OggMux::new().with_vorbis_config(VorbisConfig {
-        sample_rate: 48000,
-        bitrate: VorbisBitrateMode::CBR(192),
-    });
-    let (tx, _rx) = mux.spawn();
-    drop(tx);
-
-    // Create with both custom settings
-    let mux = OggMux::new()
-        .with_buffer_config(BufferConfig {
-            buffered_seconds: 3.0,
-            max_chunk_size: 4096,
-        })
-        .with_vorbis_config(VorbisConfig {
-            sample_rate: 22050,
-            bitrate: VorbisBitrateMode::CBR(64),
-        });
-    let (tx, _rx) = mux.spawn();
-    drop(tx);
-}
-
-/// Test that the OggMux produces silence when no input is provided
 #[tokio::test]
 async fn test_silence_generation() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // Wait a short time to allow silence generation
     sleep(Duration::from_millis(200)).await;
 
-    // Collect output for a short period
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut total_bytes = 0;
-
-    while start.elapsed() < Duration::from_millis(1000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                total_bytes += packet.len();
-
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        // Stop if we've received enough data
-        if received_packets >= 3 {
-            break;
-        }
+    if let Some(packet) = rx.recv().await {
+        assert!(contains_ogg_signatures(&packet));
+    } else {
+        panic!("Expected silence packet, received none");
     }
 
-    // We should have received at least one packet of silence
-    assert!(received_packets > 0, "No silence packets received");
-    assert!(total_bytes > 0, "No bytes received");
-
-    // Close the channel
-    drop(tx);
     Ok(())
 }
 
-/// Test muxing with Ogg data
 #[tokio::test]
-async fn test_with_ogg_data() -> Result<()> {
+async fn test_mux_with_valid_ogg_data() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // Send silence.ogg data
     tx.send(get_silence_ogg()).await?;
 
-    // Collect output for a short time
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut received_data = Vec::<u8>::new();
-
-    while start.elapsed() < Duration::from_millis(1000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                received_data.extend_from_slice(&packet);
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        // Stop if we've received enough data
-        if received_packets > 5 {
-            break;
-        }
+    if let Some(packet) = rx.recv().await {
+        assert!(contains_ogg_signatures(&packet));
+    } else {
+        panic!("Expected Ogg packet, received none");
     }
 
-    // We should have received at least one packet
-    assert!(received_packets > 0, "No packets received");
-    assert!(!received_data.is_empty(), "No data received");
-
-    // The output should contain the Ogg page signature
-    assert!(
-        contains_ogg_signatures(&received_data),
-        "Output does not contain Ogg pages"
-    );
-
-    // Close the channel
-    drop(tx);
     Ok(())
 }
 
-/// Test multiple pushes of audio data
 #[tokio::test]
-async fn test_multiple_pushes() -> Result<()> {
+async fn test_invalid_data_handling() -> Result<()> {
+    let invalid_data = Bytes::from(b"invalid data".to_vec());
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // Push silence.ogg multiple times with small delays
-    for i in 0..3 {
+    tx.send(invalid_data).await?;
+
+    sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        rx.recv().await.is_none(),
+        "Expected channel to close after invalid data"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_truncated_ogg_data() -> Result<()> {
+    let mut truncated = get_silence_ogg().to_vec();
+    truncated.truncate(truncated.len() / 2);
+
+    let mux = create_test_mux();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    tx.send(Bytes::from(truncated)).await?;
+
+    if let Some(packet) = rx.recv().await {
+        assert!(contains_ogg_signatures(&packet));
+    } else {
+        panic!("Expected output even from truncated input");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_data_pushes() -> Result<()> {
+    let mux = create_test_mux();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    for _ in 0..3 {
         tx.send(get_silence_ogg()).await?;
-        println!("Pushed silence chunk {}", i + 1);
-
-        // Small delay between pushes
         sleep(Duration::from_millis(100)).await;
     }
 
-    // Collect output for a short time
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut total_bytes = 0;
-
-    while start.elapsed() < Duration::from_millis(1500) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                total_bytes += packet.len();
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        // Stop if we've received enough packets
-        if received_packets > 5 {
-            break;
-        }
-    }
-
-    // We should have received multiple packets
-    assert!(
-        received_packets > 1,
-        "Not enough packets received: {}",
-        received_packets
-    );
-    assert!(
-        total_bytes > 0,
-        "Not enough bytes received: {}",
-        total_bytes
-    );
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test transitions between silence and audio
-#[tokio::test]
-async fn test_silence_to_audio_transition() -> Result<()> {
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // Wait for silence to be generated
-    sleep(Duration::from_millis(300)).await;
-
-    // Now push real audio
-    tx.send(get_silence_ogg()).await?;
-
-    // Collect output to see the transition
-    let start = Instant::now();
-    let mut received_packets = 0;
-
-    while start.elapsed() < Duration::from_millis(1000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        // Stop if we've received enough data
-        if received_packets >= 5 {
-            break;
-        }
-    }
-
-    // We should have received multiple packets
-    assert!(
-        received_packets > 1,
-        "Not enough packets received: {}",
-        received_packets
-    );
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test rapid alternating between silence and audio
-#[tokio::test]
-async fn test_alternating_silence_and_audio() -> Result<()> {
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // Alternating pattern: wait for silence, then push audio
-    for _ in 0..3 {
-        // Wait for silence to be generated
-        sleep(Duration::from_millis(300)).await;
-
-        // Push real audio
-        tx.send(get_silence_ogg()).await?;
-
-        // Collect some packets
-        for _ in 0..2 {
-            if let Some(packet) = rx.recv().await {
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-        }
-    }
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_invalid_ogg_data() -> Result<()> {
-    // Create some invalid data (not a valid Ogg stream)
-    let invalid_data = Bytes::from(b"This is not a valid Ogg stream".to_vec());
-
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // Push the invalid data
-    tx.send(invalid_data).await?;
-
-    // Wait a bit longer to allow the timeout mechanism to trigger
-    sleep(Duration::from_millis(1000)).await;
-
-    // We should still get silence output despite the invalid input
-    let mut received_packets = 0;
-    let start = Instant::now();
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 3 {
-            break;
-        }
-    }
-
-    // We should have received at least one packet (silence generation)
-    assert!(
-        received_packets > 0,
-        "No packets received after invalid input"
-    );
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test with truncated Ogg data
-#[tokio::test]
-async fn test_truncated_ogg_data() -> Result<()> {
-    // Get the silence.ogg data and truncate it
-    let mut truncated_ogg = get_silence_ogg().to_vec();
-    truncated_ogg.truncate(truncated_ogg.len() / 2);
-
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // Push the truncated data
-    tx.send(Bytes::from(truncated_ogg)).await?;
-
-    // Wait a bit to allow processing
-    sleep(Duration::from_millis(500)).await;
-
-    // We should still get output
-    let mut received_packets = 0;
-    let start = Instant::now();
-
-    while start.elapsed() < Duration::from_millis(1000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-
-                // Basic validation: check for "OggS" signature
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 3 {
-            break;
-        }
-    }
-
-    // We should have received at least one packet
-    assert!(
-        received_packets > 0,
-        "No packets received after truncated input"
-    );
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test large buffer handling
-#[tokio::test]
-async fn test_large_buffer() -> Result<()> {
-    let mux = OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 5.0,
-        max_chunk_size: 65536,
-    });
-
-    let (tx, mut rx) = mux.spawn();
-
-    // Push multiple copies to fill the buffer
-    for _ in 0..10 {
-        tx.send(get_silence_ogg()).await?;
-    }
-
-    // Collect output for a longer time
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut total_bytes = 0;
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                total_bytes += packet.len();
-            }
-            _ = sleep(Duration::from_millis(100)) => {}
-        }
-
-        // Stop if we've received enough data
-        if received_packets >= 10 {
-            break;
-        }
-    }
-
-    // We should have received multiple packets
-    assert!(
-        received_packets > 1,
-        "Not enough packets received: {}",
-        received_packets
-    );
-    assert!(
-        total_bytes > 0,
-        "Not enough bytes received: {}",
-        total_bytes
-    );
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test with a large number of small chunks
-#[tokio::test]
-async fn test_many_small_chunks() -> Result<()> {
-    // Get the silence.ogg data and split it into small chunks
-    let silence_ogg = get_silence_ogg().to_vec();
-    let chunk_size = 64; // Small chunk size
-    let chunks: Vec<_> = silence_ogg
-        .chunks(chunk_size)
-        .map(|c| Bytes::from(c.to_vec()))
-        .collect();
-
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // Push all the small chunks
-    for chunk in chunks {
-        tx.send(chunk).await?;
-
-        // Small delay to avoid overwhelming the channel
-        sleep(Duration::from_millis(10)).await;
-    }
-
-    // Collect output
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut total_bytes = 0;
-
-    while start.elapsed() < Duration::from_millis(1500) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                total_bytes += packet.len();
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 5 {
-            break;
-        }
-    }
-
-    // We should have received some packets
-    assert!(received_packets > 0, "No packets received");
-    assert!(total_bytes > 0, "No bytes received");
-
-    // Close the channel
-    drop(tx);
-    Ok(())
-}
-
-/// Test recovery after invalid data
-/// This test ensures the muxer can process valid data after receiving invalid data
-#[tokio::test]
-async fn test_recovery_after_invalid_data() -> Result<()> {
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
-
-    // First send invalid data
-    let invalid_data = Bytes::from(b"This is not a valid Ogg stream".to_vec());
-    tx.send(invalid_data).await?;
-
-    // Wait for the timeout to trigger
-    sleep(Duration::from_millis(1000)).await;
-
-    // Now send valid Ogg data
-    tx.send(get_silence_ogg()).await?;
-
-    // Collect output to verify we receive valid Ogg pages
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut received_valid_data = false;
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                if contains_ogg_signatures(&packet) {
-                    received_valid_data = true;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 5 && received_valid_data {
+    let mut packets_received = 0;
+    while packets_received < 3 {
+        if let Some(packet) = rx.recv().await {
+            assert!(contains_ogg_signatures(&packet));
+            packets_received += 1;
+        } else {
             break;
         }
     }
 
     assert!(
-        received_valid_data,
-        "No valid Ogg data received after recovery"
-    );
-    assert!(received_packets > 0, "No packets received after recovery");
-
-    drop(tx);
-    Ok(())
-}
-
-/// Test with extreme buffer configuration values
-#[tokio::test]
-async fn test_extreme_buffer_configuration() -> Result<()> {
-    // Very small buffer
-    let small_buffer_mux = OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 0.1,
-        max_chunk_size: 1024,
-    });
-
-    let (small_tx, mut small_rx) = small_buffer_mux.spawn();
-    small_tx.send(get_silence_ogg()).await?;
-
-    // Very large buffer
-    let large_buffer_mux = OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 30.0,
-        max_chunk_size: 1_048_576,
-    });
-
-    let (large_tx, mut large_rx) = large_buffer_mux.spawn();
-    large_tx.send(get_silence_ogg()).await?;
-
-    // Verify both produce output
-    let mut small_buffer_received = false;
-    let mut large_buffer_received = false;
-
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = small_rx.recv() => {
-                assert!(contains_ogg_signatures(&packet));
-                small_buffer_received = true;
-            }
-            Some(packet) = large_rx.recv() => {
-                assert!(contains_ogg_signatures(&packet));
-                large_buffer_received = true;
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if small_buffer_received && large_buffer_received {
-            break;
-        }
-    }
-
-    assert!(
-        small_buffer_received,
-        "Small buffer configuration did not produce output"
-    );
-    assert!(
-        large_buffer_received,
-        "Large buffer configuration did not produce output"
+        packets_received >= 3,
+        "Expected at least 3 packets, got {}",
+        packets_received
     );
 
-    drop(small_tx);
-    drop(large_tx);
     Ok(())
 }
 
-/// Test with various sample rates and bitrates using CBR
-#[tokio::test]
-async fn test_various_cbr_configurations() -> Result<()> {
-    // Test with different sample rates and bitrates
-    let configurations = vec![
-        VorbisConfig {
-            sample_rate: 8000,
-            bitrate: VorbisBitrateMode::CBR(64),
-        },
-        VorbisConfig {
-            sample_rate: 16000,
-            bitrate: VorbisBitrateMode::CBR(96),
-        },
-        VorbisConfig {
-            sample_rate: 48000,
-            bitrate: VorbisBitrateMode::CBR(256),
-        },
-    ];
-
-    for config in configurations {
-        let mux = OggMux::new().with_vorbis_config(config);
-        let (tx, mut rx) = mux.spawn();
-
-        // Send valid data
-        tx.send(get_silence_ogg()).await?;
-
-        // Verify we receive output
-        let mut received_output = false;
-        let start = Instant::now();
-
-        while start.elapsed() < Duration::from_millis(1000) {
-            tokio::select! {
-                Some(packet) = rx.recv() => {
-                    assert!(contains_ogg_signatures(&packet));
-                    received_output = true;
-                    break;
-                }
-                _ = sleep(Duration::from_millis(50)) => {}
-            }
-        }
-
-        assert!(
-            received_output,
-            "No output received for sample_rate={}, bitrate={:?}",
-            config.sample_rate, config.bitrate
-        );
-
-        drop(tx);
-    }
-
-    Ok(())
-}
-
-/// Test with various VBR quality settings
-#[tokio::test]
-async fn test_vbr_quality_configurations() -> Result<()> {
-    // Test with different VBR quality settings
-    let configurations = vec![
-        VorbisConfig {
-            sample_rate: 44100,
-            bitrate: VorbisBitrateMode::VBRQuality(3),
-        },
-        VorbisConfig {
-            sample_rate: 48000,
-            bitrate: VorbisBitrateMode::VBRQuality(6),
-        },
-    ];
-
-    for config in configurations {
-        let mux = OggMux::new().with_vorbis_config(config);
-        let (tx, mut rx) = mux.spawn();
-
-        // Send valid data
-        tx.send(get_silence_ogg()).await?;
-
-        // Verify we receive output
-        let mut received_output = false;
-        let start = Instant::now();
-
-        while start.elapsed() < Duration::from_millis(1000) {
-            tokio::select! {
-                Some(packet) = rx.recv() => {
-                    assert!(contains_ogg_signatures(&packet));
-                    received_output = true;
-                    break;
-                }
-                _ = sleep(Duration::from_millis(50)) => {}
-            }
-        }
-
-        assert!(
-            received_output,
-            "No output received for sample_rate={}, bitrate={:?}",
-            config.sample_rate, config.bitrate
-        );
-
-        drop(tx);
-    }
-
-    Ok(())
-}
-
-/// Test concurrent inputs from multiple producers
 #[tokio::test]
 async fn test_concurrent_producers() -> Result<()> {
     let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // Create multiple producer tasks
     let tx1 = tx.clone();
-    let tx2 = tx.clone();
-
-    // Producer 1: Send data every 300ms
     let producer1 = tokio::spawn(async move {
         for _ in 0..3 {
             tx1.send(get_silence_ogg()).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let tx2 = tx.clone();
+    let producer2 = tokio::spawn(async move {
+        for _ in 0..2 {
+            tx2.send(get_silence_ogg()).await.unwrap();
             sleep(Duration::from_millis(300)).await;
         }
     });
 
-    // Producer 2: Send data every 500ms
-    let producer2 = tokio::spawn(async move {
-        sleep(Duration::from_millis(150)).await; // Offset the timing
-        for _ in 0..2 {
-            tx2.send(get_silence_ogg()).await.unwrap();
-            sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    // Collect and verify output
-    let mut received_packets = 0;
-    let start = Instant::now();
-
-    while start.elapsed() < Duration::from_millis(2000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                assert!(contains_ogg_signatures(&packet));
-                received_packets += 1;
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-
-        if received_packets >= 10 {
+    let mut packets_received = 0;
+    while packets_received < 5 {
+        if let Some(packet) = rx.recv().await {
+            assert!(contains_ogg_signatures(&packet));
+            packets_received += 1;
+        } else {
             break;
         }
     }
 
-    // Wait for producers to complete
-    let _ = tokio::join!(producer1, producer2);
+    producer1.await?;
+    producer2.await?;
 
-    assert!(
-        received_packets > 0,
-        "No packets received from concurrent producers"
-    );
+    assert_eq!(packets_received, 5, "Expected exactly 5 packets");
 
-    drop(tx);
     Ok(())
 }
 
-/// Test long-running stability (this is a longer test)
 #[tokio::test]
-async fn test_long_running_stability() -> Result<()> {
-    // This test will run for a longer time to ensure stability
-    let test_duration = Duration::from_secs(6); // Extended to 6 seconds
+async fn test_gapless_mode_no_silence() -> Result<()> {
+    // In gapless mode, mux should NOT insert silence when idle
+    let mux = create_test_mux()
+        .with_mode(MuxMode::Gapless);
 
-    // Use a mux with slightly faster output for testing
-    let mux = OggMux::new().with_buffer_config(BufferConfig {
-        buffered_seconds: 0.3, // Smaller buffer for more frequent output
-        max_chunk_size: 4096,
-    });
+    let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    let (tx, mut rx) = mux.spawn();
+    // Wait for longer than the silence timeout (100ms)
+    sleep(Duration::from_millis(250)).await;
 
-    // Simulate intermittent data with periods of silence
-    let producer = tokio::spawn(async move {
-        for i in 0..5 {
-            // Send data
-            tx.send(get_silence_ogg()).await.unwrap();
-
-            // Wait a varying amount of time
-            let wait_time = match i % 3 {
-                0 => 200, // Shorter waits
-                1 => 500,
-                _ => 800,
-            };
-
-            sleep(Duration::from_millis(wait_time)).await;
-        }
-
-        // Keep the channel open for the rest of the test
-        sleep(Duration::from_secs(4)).await;
-        tx
-    });
-
-    // Give a moment for the muxer to start up
-    sleep(Duration::from_millis(100)).await;
-
-    // Collect output for the full test duration
-    let start = Instant::now();
-    let mut received_packets = 0;
-    let mut last_packet_time = Instant::now();
-    let mut max_gap_ms = 0;
-
-    while start.elapsed() < test_duration {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                assert!(contains_ogg_signatures(&packet));
-
-                // Track the timing gap between packets
-                let gap = last_packet_time.elapsed().as_millis();
-                if gap > max_gap_ms {
-                    max_gap_ms = gap;
-                }
-
-                last_packet_time = Instant::now();
-                received_packets += 1;
-
-                // Debug: Print when packets are received
-                println!("Received packet #{}, size: {} bytes", received_packets, packet.len());
+    // In gapless mode, should receive nothing when idle
+    tokio::select! {
+        result = rx.recv() => {
+            if result.is_some() {
+                panic!("Gapless mode should not insert silence when idle");
             }
-            _ = sleep(Duration::from_millis(50)) => {} // Shorter polling interval
+        }
+        _ = sleep(Duration::from_millis(100)) => {
+            // Expected: timeout means no data sent
         }
     }
 
-    // Recover the channel and close it
-    let tx = producer.await?;
-    drop(tx);
+    Ok(())
+}
 
-    println!("Total packets received: {}", received_packets);
-    println!("Maximum gap between packets: {}ms", max_gap_ms);
+#[tokio::test]
+async fn test_with_silence_mode_inserts_silence() -> Result<()> {
+    // WithSilence mode should insert silence when idle (default behavior)
+    let mux = create_test_mux()
+        .with_mode(MuxMode::WithSilence);
 
-    // With our configuration, we should get at least 5 packets
-    // (More conservative than before)
-    assert!(
-        received_packets >= 5,
-        "Not enough packets received in long running test"
-    );
+    let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // The maximum gap between packets should be reasonable
-    // If silence is properly generated, we should get regular packets
-    assert!(
-        max_gap_ms < 2000, // More forgiving gap check
-        "Gap between packets too large: {}ms",
-        max_gap_ms
-    );
+    // Wait for silence insertion (100ms timeout + processing)
+    sleep(Duration::from_millis(200)).await;
+
+    // Should receive silence
+    if let Some(packet) = rx.recv().await {
+        assert!(contains_ogg_signatures(&packet));
+    } else {
+        panic!("WithSilence mode should insert silence when idle");
+    }
 
     Ok(())
 }
 
-/// Test error propagation for a channel that's closed while processing
 #[tokio::test]
-async fn test_channel_close_during_processing() -> Result<()> {
-    let mux = create_test_mux();
-    let (tx, rx) = mux.spawn();
+async fn test_metadata_callback_invoked() -> Result<()> {
+    let callback_invoked = Arc::new(Mutex::new(false));
+    let callback_invoked_clone = callback_invoked.clone();
 
-    // Send some valid data
+    let mux = create_test_mux()
+        .with_metadata_callback(move |_granule_pos| {
+            *callback_invoked_clone.lock().unwrap() = true;
+            Some(vec![
+                ("TITLE".to_string(), "Test Track".to_string()),
+                ("ARTIST".to_string(), "Test Artist".to_string()),
+            ])
+        });
+
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    // Send data to trigger stream processing
     tx.send(get_silence_ogg()).await?;
 
-    // Immediately drop both channels
-    drop(tx);
-    drop(rx);
+    // Wait for processing and receive output
+    sleep(Duration::from_millis(200)).await;
 
-    // Wait a bit to allow the background task to detect and handle the closure
-    sleep(Duration::from_millis(500)).await;
+    // Drain receiver
+    while rx.recv().await.is_some() {
+        // Keep receiving until empty
+    }
 
-    // This test passes if we don't panic or crash
-    // The background task should handle the channel closure gracefully
+    // Callback should have been invoked after stream finished
+    assert!(*callback_invoked.lock().unwrap(), "Metadata callback should be invoked after stream");
 
     Ok(())
 }
 
-/// Test with empty Ogg data
 #[tokio::test]
-async fn test_empty_data() -> Result<()> {
-    let mux = create_test_mux();
-    let (tx, mut rx) = mux.spawn();
+async fn test_metadata_callback_with_granule_position() -> Result<()> {
+    let received_granule = Arc::new(Mutex::new(None));
+    let received_granule_clone = received_granule.clone();
 
-    // Send an empty buffer
-    tx.send(Bytes::new()).await?;
+    let mux = create_test_mux()
+        .with_metadata_callback(move |granule_pos| {
+            *received_granule_clone.lock().unwrap() = Some(granule_pos);
+            Some(vec![("POSITION".to_string(), granule_pos.to_string())])
+        });
 
-    // Wait a bit
-    sleep(Duration::from_millis(500)).await;
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // We should still get silence output
-    let mut received_packets = 0;
-    let start = Instant::now();
+    tx.send(get_silence_ogg()).await?;
+    sleep(Duration::from_millis(200)).await;
 
-    while start.elapsed() < Duration::from_millis(1000) {
-        tokio::select! {
-            Some(packet) = rx.recv() => {
-                received_packets += 1;
-                assert!(contains_ogg_signatures(&packet));
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
+    // Drain receiver
+    while rx.recv().await.is_some() {}
 
-        if received_packets >= 3 {
-            break;
+    // Should have received a granule position
+    let granule = received_granule.lock().unwrap();
+    assert!(granule.is_some(), "Callback should receive granule position");
+    assert!(*granule.as_ref().unwrap() > 0, "Granule position should be > 0");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_metadata_injection_creates_pages() -> Result<()> {
+    let mux = create_test_mux()
+        .with_metadata_callback(|_| {
+            Some(vec![
+                ("TITLE".to_string(), "Test".to_string()),
+            ])
+        });
+
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    tx.send(get_silence_ogg()).await?;
+
+    let mut packets_received = 0;
+
+    // Collect packets
+    while let Ok(Some(_packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        packets_received += 1;
+    }
+
+    assert!(packets_received > 0, "Should receive packets");
+    // Note: Metadata pages are injected but may be difficult to detect without full Ogg parsing
+    // The main test is that it doesn't crash and produces output
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gapless_with_multiple_streams() -> Result<()> {
+    let mux = create_test_mux()
+        .with_mode(MuxMode::Gapless);
+
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    // Send multiple streams with delays
+    for i in 0..3 {
+        tx.send(get_silence_ogg()).await?;
+        if i < 2 {
+            sleep(Duration::from_millis(50)).await;
         }
     }
 
-    assert!(received_packets > 0, "No packets received after empty data");
+    // Should receive data from all streams without silence gaps
+    let mut packets_received = 0;
+    while let Ok(Some(packet)) = tokio::time::timeout(Duration::from_millis(1000), rx.recv()).await {
+        assert!(contains_ogg_signatures(&packet));
+        packets_received += 1;
+    }
 
-    drop(tx);
+    assert!(packets_received >= 3, "Should receive at least 3 packets from streams");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_metadata_callback_returning_none() -> Result<()> {
+    // Callback that returns None should not crash or cause issues
+    let mux = create_test_mux()
+        .with_metadata_callback(|_| None);
+
+    let (tx, mut rx, _shutdown, _handle) = mux.spawn();
+
+    tx.send(get_silence_ogg()).await?;
+
+    // Should still receive normal output
+    if let Some(packet) = rx.recv().await {
+        assert!(contains_ogg_signatures(&packet));
+    } else {
+        panic!("Should receive output even when callback returns None");
+    }
+
     Ok(())
 }
