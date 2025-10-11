@@ -124,6 +124,10 @@ impl StreamProcessor {
         if consumed > 0 {
             self.buffer.advance(consumed);
         } else if self.buffer.len() > 1_048_576 {
+            // Safety valve: If we've buffered >1MB without finding a valid Ogg page,
+            // the data is likely corrupt or not Ogg format at all. Clear the buffer
+            // to prevent unbounded memory growth. For reference, typical Ogg pages
+            // are 4-8KB, so 1MB should be more than sufficient for any valid stream.
             warn!(
                 "Large buffer ({} bytes) with no pages; clearing",
                 self.buffer.len()
