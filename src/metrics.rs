@@ -84,7 +84,8 @@ impl StreamMetrics {
         } else {
             stats.min = stats.min.min(utilization);
             stats.max = stats.max.max(utilization);
-            stats.avg = (stats.avg * stats.samples as f64 + utilization) / (stats.samples as f64 + 1.0);
+            stats.avg =
+                (stats.avg * stats.samples as f64 + utilization) / (stats.samples as f64 + 1.0);
         }
         stats.samples += 1;
         stats.last = utilization;
@@ -101,7 +102,8 @@ impl StreamMetrics {
         } else {
             stats.min = stats.min.min(latency_ms);
             stats.max = stats.max.max(latency_ms);
-            stats.avg = (stats.avg * stats.samples as f64 + latency_ms) / (stats.samples as f64 + 1.0);
+            stats.avg =
+                (stats.avg * stats.samples as f64 + latency_ms) / (stats.samples as f64 + 1.0);
         }
         stats.samples += 1;
         stats.last = latency_ms;
@@ -154,7 +156,6 @@ impl StreamMetrics {
         }
         (self.silence_bytes_inserted as f64 / self.bytes_processed as f64) * 100.0
     }
-
 }
 
 /// Thread-safe metrics collector.
@@ -232,21 +233,21 @@ mod tests {
     fn test_metric_stats_updates() {
         // Test buffer utilization stats
         let mut metrics = StreamMetrics::new();
-        
+
         // First value
         metrics.record_buffer_utilization(10.0);
         assert_eq!(metrics.buffer_utilization.min, 10.0);
         assert_eq!(metrics.buffer_utilization.max, 10.0);
         assert_eq!(metrics.buffer_utilization.avg, 10.0);
         assert_eq!(metrics.buffer_utilization.samples, 1);
-        
+
         // Second value
         metrics.record_buffer_utilization(20.0);
         assert_eq!(metrics.buffer_utilization.min, 10.0);
         assert_eq!(metrics.buffer_utilization.max, 20.0);
         assert_eq!(metrics.buffer_utilization.avg, 15.0);
         assert_eq!(metrics.buffer_utilization.samples, 2);
-        
+
         // Third value - lower than min
         metrics.record_buffer_utilization(5.0);
         assert_eq!(metrics.buffer_utilization.min, 5.0);
@@ -258,15 +259,15 @@ mod tests {
     #[test]
     fn test_silence_percentage() {
         let mut metrics = StreamMetrics::new();
-        
+
         // No data
         assert_eq!(metrics.silence_percentage(), 0.0);
-        
+
         // Some data
         metrics.add_bytes_processed(1000);
         metrics.add_silence_bytes(250);
         assert_eq!(metrics.silence_percentage(), 25.0);
-        
+
         // More data
         metrics.add_bytes_processed(1000);
         metrics.add_silence_bytes(250);
@@ -277,10 +278,10 @@ mod tests {
     fn test_uptime_and_idle() {
         let metrics = StreamMetrics::new();
         thread::sleep(Duration::from_millis(10));
-        
+
         assert!(metrics.uptime_seconds() > 0.0);
         assert!(metrics.idle_seconds() > 0.0);
-        
+
         // Idle should be same as uptime initially
         assert!((metrics.idle_seconds() - metrics.uptime_seconds()).abs() < 0.001);
     }
@@ -288,29 +289,29 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_collector() {
         let collector = MetricsCollector::new();
-        
+
         // Record some metrics
         collector.record_buffer_utilization(50.0).await;
         collector.add_bytes_processed(1000).await;
         collector.add_silence_bytes(200).await;
         collector.increment_real_streams().await;
-        
+
         // Get snapshot
         let snapshot = collector.snapshot().await;
-        
+
         // Verify snapshot
         assert_eq!(snapshot.bytes_processed, 1000);
         assert_eq!(snapshot.silence_bytes_inserted, 200);
         assert_eq!(snapshot.silence_insertions, 1);
         assert_eq!(snapshot.real_streams_processed, 1);
         assert_eq!(snapshot.buffer_utilization.last, 50.0);
-        
+
         // Reset and verify
         collector.reset().await;
         let new_snapshot = collector.snapshot().await;
         assert_eq!(new_snapshot.bytes_processed, 0);
         assert_eq!(new_snapshot.silence_insertions, 0);
-        
+
         // Start time should be preserved
         assert!((new_snapshot.start_time.duration_since(snapshot.start_time)).as_nanos() < 1000);
     }

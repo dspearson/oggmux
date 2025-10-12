@@ -15,7 +15,7 @@ use bytes::Bytes;
 use oggmux::OggMux;
 use std::env;
 use std::fs;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<()> {

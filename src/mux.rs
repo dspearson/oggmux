@@ -1,10 +1,10 @@
+use crate::metrics::MetricsCollector;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{debug, warn};
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout, Duration};
-use crate::metrics::MetricsCollector;
+use tokio::time::{Duration, sleep, timeout};
 
 use crate::silence::SilenceTemplate;
 use crate::stream::StreamProcessor;
@@ -87,10 +87,7 @@ impl VorbisConfig {
         );
         match self.bitrate {
             VorbisBitrateMode::CBR(kbps) => {
-                assert!(
-                    kbps > 0,
-                    "VorbisConfig: CBR bitrate must be non-zero"
-                );
+                assert!(kbps > 0, "VorbisConfig: CBR bitrate must be non-zero");
             }
             VorbisBitrateMode::VBRQuality(_) => {
                 // Quality levels 0-10 are all valid
@@ -163,7 +160,7 @@ impl StreamSession {
                     self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                         .await;
                     match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
-                        Ok(Ok(())) => {},
+                        Ok(Ok(())) => {}
                         Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                         Err(_) => {
                             warn!("Output send timeout - consumer too slow, dropping packet");
@@ -175,7 +172,7 @@ impl StreamSession {
                     if let Some(ref mc) = metrics_collector {
                         mc.add_bytes_processed(out.len()).await;
                     }
-                    
+
                     *granule_position_ref = self.stream_processor.get_granule_position();
                 }
             }
@@ -187,10 +184,12 @@ impl StreamSession {
                 self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                     .await;
                 match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
-                    Ok(Ok(())) => {},
+                    Ok(Ok(())) => {}
                     Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                     Err(_) => {
-                        warn!("Output send timeout - consumer too slow, dropping final silence packet");
+                        warn!(
+                            "Output send timeout - consumer too slow, dropping final silence packet"
+                        );
                     }
                 }
 
@@ -226,33 +225,35 @@ impl StreamSession {
                         .stream_processor
                         .process(&data)
                         .context("processing real audio chunk")?;
-                        
+
                     // Record processing latency in metrics
-                    if let Some(ref mc) = &metrics_collector {
+                    if let Some(mc) = &metrics_collector {
                         let latency = process_start.elapsed().as_secs_f64() * 1000.0;
                         mc.record_processing_latency(latency).await;
                     }
-                    
+
                     if !out.is_empty() {
                         self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                             .await;
                         match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
-                            Ok(Ok(())) => {},
+                            Ok(Ok(())) => {}
                             Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                             Err(_) => {
-                                warn!("Output send timeout - consumer too slow, dropping real audio packet");
+                                warn!(
+                                    "Output send timeout - consumer too slow, dropping real audio packet"
+                                );
                             }
                         }
 
                         // Record output bytes in metrics
-                        if let Some(ref mc) = &metrics_collector {
+                        if let Some(mc) = &metrics_collector {
                             mc.add_bytes_processed(out.len()).await;
                         }
                     }
                     *granule_position_ref = self.stream_processor.get_granule_position();
-                    
+
                     // Record buffer utilization
-                    if let Some(ref mc) = &metrics_collector {
+                    if let Some(mc) = &metrics_collector {
                         let lead = clock.lead_secs(*granule_position_ref);
                         let utilization = (lead / buffered_seconds) * 100.0;
                         mc.record_buffer_utilization(utilization).await;
@@ -263,7 +264,9 @@ impl StreamSession {
                     if !self.stream_processor.has_produced_output()
                         && last_action_time.elapsed() > input_timeout
                     {
-                        debug!("No valid output produced after timeout; breaking to restart with silence");
+                        debug!(
+                            "No valid output produced after timeout; breaking to restart with silence"
+                        );
                         break;
                     }
                     sleep(Duration::from_millis(10)).await;
@@ -280,15 +283,17 @@ impl StreamSession {
             self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
                 .await;
             match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                 Err(_) => {
-                    warn!("Output send timeout - consumer too slow, dropping final real audio packet");
+                    warn!(
+                        "Output send timeout - consumer too slow, dropping final real audio packet"
+                    );
                 }
             }
 
             // Record output bytes in metrics
-            if let Some(ref mc) = &metrics_collector {
+            if let Some(mc) = &metrics_collector {
                 mc.add_bytes_processed(final_out.len()).await;
             }
         }
@@ -371,7 +376,7 @@ impl OggMux {
         self.silence = silence;
         self
     }
-    
+
     /// Add metrics collection to the OggMux.
     ///
     /// Enables collecting performance metrics such as buffer utilization,
@@ -380,7 +385,7 @@ impl OggMux {
         self.metrics_collector = Some(crate::metrics::MetricsCollector::new());
         self
     }
-    
+
     /// Get access to the metrics collector, if enabled.
     ///
     /// Returns the metrics collector instance if it was enabled
@@ -430,17 +435,81 @@ impl OggMux {
     fn load_default_silence(config: &VorbisConfig) -> SilenceTemplate {
         let key = config.silence_key();
         match key.as_str() {
-            "44100_192" => {
-                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
+            // 44.1 kHz CBR templates
+            "44100_64" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_64.ogg"))
+            }
+            "44100_96" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_96.ogg"))
             }
             "44100_128" => {
                 SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_128.ogg"))
             }
+            "44100_160" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_160.ogg"))
+            }
+            "44100_192" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_192.ogg"))
+            }
+            "44100_256" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_256.ogg"))
+            }
             "44100_320" => {
                 SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_320.ogg"))
             }
+            // 44.1 kHz VBR templates
+            "44100_q2" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_q2.ogg"))
+            }
+            "44100_q4" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_q4.ogg"))
+            }
+            "44100_q5" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_q5.ogg"))
+            }
+            "44100_q6" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_q6.ogg"))
+            }
+            "44100_q8" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_44100_q8.ogg"))
+            }
+            // 48 kHz CBR templates
+            "48000_64" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_64.ogg"))
+            }
+            "48000_96" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_96.ogg"))
+            }
+            "48000_128" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_128.ogg"))
+            }
+            "48000_160" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_160.ogg"))
+            }
+            "48000_192" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_192.ogg"))
+            }
+            "48000_256" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_256.ogg"))
+            }
+            "48000_320" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_320.ogg"))
+            }
+            // 48 kHz VBR templates
+            "48000_q2" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q2.ogg"))
+            }
+            "48000_q4" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q4.ogg"))
+            }
+            "48000_q5" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q5.ogg"))
+            }
             "48000_q6" => {
                 SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q6.ogg"))
+            }
+            "48000_q8" => {
+                SilenceTemplate::new_embedded(include_bytes!("../resources/silence_48000_q8.ogg"))
             }
             _ => {
                 warn!(
@@ -493,7 +562,9 @@ impl OggMux {
     /// }
     /// # }
     /// ```
-    pub fn spawn(mut self) -> (
+    pub fn spawn(
+        mut self,
+    ) -> (
         mpsc::Sender<Bytes>,
         mpsc::Receiver<Bytes>,
         mpsc::Sender<()>,
@@ -530,7 +601,7 @@ impl OggMux {
                                     debug!("Starting REAL stream, serial=0x{:x}", serial);
 
                                     let mut session = StreamSession::new_real(serial, global_granule_position);
-                                    
+
                                     // Record real stream in metrics
                                     if let Some(ref mc) = metrics_collector {
                                         mc.increment_real_streams().await;
@@ -540,13 +611,13 @@ impl OggMux {
                                     let process_start = Instant::now();
                                     let out = session.stream_processor.process(&first_chunk)
                                         .context("processing initial real chunk")?;
-                                        
+
                                     // Record processing latency
                                     if let Some(ref mc) = metrics_collector {
                                         let latency = process_start.elapsed().as_secs_f64() * 1000.0;
                                         mc.record_processing_latency(latency).await;
                                     }
-                                    
+
                                     if !out.is_empty() {
                                         session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
                                         match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
@@ -687,7 +758,10 @@ mod tests {
         let (_input_tx, _output_rx, shutdown_tx, handle) = mux.spawn();
 
         // Signal shutdown
-        shutdown_tx.send(()).await.expect("Failed to send shutdown signal");
+        shutdown_tx
+            .send(())
+            .await
+            .expect("Failed to send shutdown signal");
 
         // Task should exit cleanly
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;

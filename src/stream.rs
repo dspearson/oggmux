@@ -121,15 +121,16 @@ impl StreamProcessor {
                     }
 
                     // Filter out non-Vorbis streams (e.g., album art)
-                    if self.seen_bos && !self.vorbis_serials.is_empty() {
-                        if !self.vorbis_serials.contains(&input_serial) {
-                            debug!(
-                                "Filtering out non-Vorbis page from serial={:#x} (detected as album art or other stream)",
-                                input_serial
-                            );
-                            consumed = end;
-                            continue;
-                        }
+                    if self.seen_bos
+                        && !self.vorbis_serials.is_empty()
+                        && !self.vorbis_serials.contains(&input_serial)
+                    {
+                        debug!(
+                            "Filtering out non-Vorbis page from serial={:#x} (detected as album art or other stream)",
+                            input_serial
+                        );
+                        consumed = end;
+                        continue;
                     }
 
                     // Remap granule position
@@ -251,7 +252,6 @@ mod tests {
 
         // Create a minimal mock BOS page structure
         // In real usage, this would come from actual Ogg file parsing
-        use std::io::Cursor;
 
         // Vorbis identification header starts with [0x01, 'v', 'o', 'r', 'b', 'i', 's']
         let vorbis_header = b"\x01vorbis\x00\x00\x00\x00\x02\x00";

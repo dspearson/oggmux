@@ -105,7 +105,7 @@ This approach is ideal for applications where a continuous stream must be mainta
 
 ## Requirements
 
-- Rust 2021 edition or later
+- Rust 2024 edition or later
 - Tokio runtime
 
 ## Utility Functions
