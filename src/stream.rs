@@ -209,6 +209,11 @@ impl StreamProcessor {
         self.last_output_abgp
     }
 
+    /// Get current sequence number.
+    pub fn get_sequence_number(&self) -> u32 {
+        self.sequence_number
+    }
+
     /// Check if finished.
     pub fn is_finished(&self) -> bool {
         self.finished

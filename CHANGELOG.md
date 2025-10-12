@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-10-11
+
+### Added
+- **Gapless playback mode**: New `MuxMode` enum with `Gapless` and `WithSilence` options
+  - `MuxMode::Gapless`: Direct stream concatenation without silence gaps
+  - `MuxMode::WithSilence`: Original behavior (default for backward compatibility)
+  - Configured via `.with_mode()` builder method
+- **Metadata injection system**: Inject Vorbis comments at track boundaries
+  - `MetadataCallback` type for user-provided metadata generation
+  - Callback receives granule position and returns key-value comment pairs
+  - Configured via `.with_metadata_callback()` builder method
+  - Completely agnostic - no application-specific code
+- **Vorbis comment support**: New `comments` module for metadata handling
+  - `generate_comment_packet()`: Creates Vorbis comment packets
+  - `create_comment_page()`: Wraps comments in Ogg pages with proper CRC
+  - Full Vorbis I specification compliance
+- **Enhanced StreamProcessor**: Added `get_sequence_number()` for sequence tracking
+- **Comprehensive test suite**: 13 new tests covering all features
+  - Unit tests for comment generation and page creation
+  - Integration tests for gapless mode and metadata injection
+  - Unicode metadata support tests
+  - Multi-segment handling tests
+
+### Changed
+- Gapless mode skips silence insertion timeout when idle (waits for input instead)
+- Metadata pages injected after each real audio stream completes
+- Metadata errors logged as warnings (non-fatal)
+
+### Use Cases
+Perfect for:
+- DJ deck streaming with track metadata
+- Gapless music playback
+- Icecast streaming with embedded track info
+- Applications requiring continuous audio without gaps
+
+### API Example
+```rust
+let mux = OggMux::new()
+    .with_mode(MuxMode::Gapless)
+    .with_metadata_callback(|granule_pos| {
+        Some(vec![
+            ("TITLE".to_string(), "Track Name".to_string()),
+            ("ARTIST".to_string(), "Artist Name".to_string()),
+        ])
+    });
+```
+
 ## [0.2.0] - 2025-10-11
 
 ### Added
@@ -107,7 +154,8 @@ handle.await??;  // Check for errors
 - Comprehensive Ogg Vorbis stream muxing
 - CI pipeline with GitHub Actions
 
-[Unreleased]: https://github.com/dspearson/oggmux/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dspearson/oggmux/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dspearson/oggmux/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dspearson/oggmux/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/dspearson/oggmux/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dspearson/oggmux/compare/v0.1.0...v0.1.1

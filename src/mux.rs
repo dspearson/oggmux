@@ -9,6 +9,7 @@ use crate::metrics::MetricsCollector;
 use crate::silence::SilenceTemplate;
 use crate::stream::StreamProcessor;
 use crate::timing::StreamClock;
+use crate::comments::{generate_comment_packet, create_comment_page};
 
 /// Timeout for output sends - prevents indefinite blocking if consumer is slow
 const OUTPUT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,6 +98,21 @@ impl VorbisConfig {
         }
     }
 }
+
+/// Operating mode for the muxer
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MuxMode {
+    /// Insert silence between streams (original behavior for Icecast)
+    WithSilence,
+    /// Direct stream concatenation without silence gaps (gapless playback)
+    Gapless,
+}
+
+/// Callback type for metadata injection at track boundaries.
+///
+/// The callback receives the current granule position and returns an optional
+/// vector of (key, value) comment pairs to inject as a Vorbis comment packet.
+pub type MetadataCallback = Box<dyn Fn(u64) -> Option<Vec<(String, String)>> + Send + Sync>;
 
 /// Single "session" that processes exactly one Ogg stream (real or silence).
 struct StreamSession {
@@ -191,6 +207,11 @@ impl StreamSession {
         let input_timeout = Duration::from_millis(500);
 
         loop {
+            // Check if stream is finished before trying to receive more data
+            if self.stream_processor.is_finished() {
+                break;
+            }
+
             let lead = clock.lead_secs(*granule_position_ref);
             if lead >= buffered_seconds {
                 sleep(Duration::from_millis(20)).await;
@@ -249,10 +270,6 @@ impl StreamSession {
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
-
-            if self.stream_processor.is_finished() {
-                break;
-            }
         }
 
         let final_out = self
@@ -298,6 +315,8 @@ pub struct OggMux {
     silence: SilenceTemplate,
     initial_serial: u32,
     metrics_collector: Option<crate::metrics::MetricsCollector>,
+    mode: MuxMode,
+    metadata_callback: Option<MetadataCallback>,
 }
 
 impl OggMux {
@@ -317,6 +336,8 @@ impl OggMux {
             silence,
             initial_serial: 0xfeed_0000,
             metrics_collector: None,
+            mode: MuxMode::WithSilence,
+            metadata_callback: None,
         }
     }
 
@@ -366,6 +387,43 @@ impl OggMux {
     /// with `with_metrics()`, or None if metrics collection is disabled.
     pub fn metrics(&self) -> Option<crate::metrics::MetricsCollector> {
         self.metrics_collector.clone()
+    }
+
+    /// Set the operating mode for the muxer.
+    ///
+    /// - `MuxMode::WithSilence`: Insert silence between streams (default, for Icecast)
+    /// - `MuxMode::Gapless`: Direct concatenation without silence gaps (for gapless playback)
+    pub fn with_mode(mut self, mode: MuxMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set a callback that will be invoked at track boundaries to inject metadata.
+    ///
+    /// The callback receives the current granule position and returns an optional
+    /// vector of (key, value) comment pairs to inject into the stream as a Vorbis
+    /// comment packet.
+    ///
+    /// # Example
+    /// ```
+    /// use oggmux::{OggMux, MuxMode};
+    ///
+    /// let mux = OggMux::new()
+    ///     .with_mode(MuxMode::Gapless)
+    ///     .with_metadata_callback(|granule_pos| {
+    ///         Some(vec![
+    ///             ("TITLE".to_string(), "My Song".to_string()),
+    ///             ("ARTIST".to_string(), "My Artist".to_string()),
+    ///             ("CUSTOM_GRANULE".to_string(), granule_pos.to_string()),
+    ///         ])
+    ///     });
+    /// ```
+    pub fn with_metadata_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u64) -> Option<Vec<(String, String)>> + Send + Sync + 'static,
+    {
+        self.metadata_callback = Some(Box::new(callback));
+        self
     }
 
     /// Load the default embedded silence template based on the Vorbis config.
@@ -508,6 +566,35 @@ impl OggMux {
 
                                     // Continue session
                                     session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
+
+                                    // Inject metadata if callback is configured
+                                    if let Some(ref callback) = self.metadata_callback {
+                                        if let Some(comments) = callback(global_granule_position) {
+                                            debug!("Injecting metadata at granule position {}", global_granule_position);
+                                            let sequence = session.stream_processor.get_sequence_number();
+                                            match generate_comment_packet(comments) {
+                                                Ok(packet) => {
+                                                    match create_comment_page(packet, serial, sequence, global_granule_position) {
+                                                        Ok(page) => {
+                                                            match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(page)).await {
+                                                                Ok(Ok(())) => {},
+                                                                Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                                                                Err(_) => {
+                                                                    warn!("Output send timeout - consumer too slow, dropping metadata page");
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Failed to create metadata page: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to generate metadata packet: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 None => {
                                     debug!("Input channel closed; exiting mux loop");
@@ -517,22 +604,27 @@ impl OggMux {
                         }
                         // Optional timeout to insert silence if input is idle
                         _ = sleep(Duration::from_millis(100)) => {
-                            let serial = self.next_serial();
-                            debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
+                            // Only insert silence if not in gapless mode
+                            if self.mode == MuxMode::WithSilence {
+                                let serial = self.next_serial();
+                                debug!("Inserting SILENCE stream, serial=0x{:x}", serial);
 
-                            let silence_data: Bytes = self.silence.raw_bytes().to_vec().into();
-                            let mut session = StreamSession::new_silence(
-                                serial,
-                                global_granule_position,
-                                silence_data.clone(),
-                            );
-                            
-                            // Record silence insertion in metrics
-                            if let Some(ref mc) = metrics_collector {
-                                mc.add_silence_bytes(silence_data.len()).await;
+                                let silence_data: Bytes = self.silence.raw_bytes().to_vec().into();
+                                let mut session = StreamSession::new_silence(
+                                    serial,
+                                    global_granule_position,
+                                    silence_data.clone(),
+                                );
+
+                                // Record silence insertion in metrics
+                                if let Some(ref mc) = metrics_collector {
+                                    mc.add_silence_bytes(silence_data.len()).await;
+                                }
+
+                                session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
+                            } else {
+                                debug!("Gapless mode: waiting for input without silence");
                             }
-                            
-                            session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
                         }
                     }
                 }
