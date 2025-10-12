@@ -207,6 +207,11 @@ impl StreamSession {
         let input_timeout = Duration::from_millis(500);
 
         loop {
+            // Check if stream is finished before trying to receive more data
+            if self.stream_processor.is_finished() {
+                break;
+            }
+
             let lead = clock.lead_secs(*granule_position_ref);
             if lead >= buffered_seconds {
                 sleep(Duration::from_millis(20)).await;
@@ -264,10 +269,6 @@ impl StreamSession {
                     sleep(Duration::from_millis(10)).await;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-
-            if self.stream_processor.is_finished() {
-                break;
             }
         }
 

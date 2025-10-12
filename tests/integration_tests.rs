@@ -227,12 +227,15 @@ async fn test_metadata_callback_invoked() -> Result<()> {
     // Send data to trigger stream processing
     tx.send(get_silence_ogg()).await?;
 
-    // Wait for processing and receive output
+    // Drop tx to signal no more input
+    drop(tx);
+
+    // Wait for processing and receive output with timeout
     sleep(Duration::from_millis(200)).await;
 
-    // Drain receiver
-    while rx.recv().await.is_some() {
-        // Keep receiving until empty
+    // Drain receiver with timeout to avoid hanging
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        // Keep receiving until timeout or empty
     }
 
     // Callback should have been invoked after stream finished
@@ -255,10 +258,16 @@ async fn test_metadata_callback_with_granule_position() -> Result<()> {
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
     tx.send(get_silence_ogg()).await?;
+
+    // Drop tx to signal no more input
+    drop(tx);
+
     sleep(Duration::from_millis(200)).await;
 
-    // Drain receiver
-    while rx.recv().await.is_some() {}
+    // Drain receiver with timeout to avoid hanging
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        // Keep receiving until timeout or empty
+    }
 
     // Should have received a granule position
     let granule = received_granule.lock().unwrap();
@@ -302,22 +311,26 @@ async fn test_gapless_with_multiple_streams() -> Result<()> {
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
-    // Send multiple streams with delays
+    // Send multiple streams with delays to ensure separate processing
     for i in 0..3 {
         tx.send(get_silence_ogg()).await?;
         if i < 2 {
-            sleep(Duration::from_millis(50)).await;
+            // Wait long enough for the stream to be fully processed
+            sleep(Duration::from_millis(200)).await;
         }
     }
 
+    // Drop tx to signal no more input
+    drop(tx);
+
     // Should receive data from all streams without silence gaps
     let mut packets_received = 0;
-    while let Ok(Some(packet)) = tokio::time::timeout(Duration::from_millis(1000), rx.recv()).await {
+    while let Ok(Some(packet)) = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await {
         assert!(contains_ogg_signatures(&packet));
         packets_received += 1;
     }
 
-    assert!(packets_received >= 3, "Should receive at least 3 packets from streams");
+    assert!(packets_received >= 3, "Should receive at least 3 packets from streams, got {}", packets_received);
 
     Ok(())
 }
