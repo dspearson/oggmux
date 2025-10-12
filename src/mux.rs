@@ -6,10 +6,10 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 
+use crate::comments::{create_comment_page, generate_comment_packet};
 use crate::silence::SilenceTemplate;
 use crate::stream::StreamProcessor;
 use crate::timing::StreamClock;
-use crate::comments::{generate_comment_packet, create_comment_page};
 
 /// Timeout for output sends - prevents indefinite blocking if consumer is slow
 const OUTPUT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -639,30 +639,30 @@ impl OggMux {
                                     session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
 
                                     // Inject metadata if callback is configured
-                                    if let Some(ref callback) = self.metadata_callback {
-                                        if let Some(comments) = callback(global_granule_position) {
-                                            debug!("Injecting metadata at granule position {}", global_granule_position);
-                                            let sequence = session.stream_processor.get_sequence_number();
-                                            match generate_comment_packet(comments) {
-                                                Ok(packet) => {
-                                                    match create_comment_page(packet, serial, sequence, global_granule_position) {
-                                                        Ok(page) => {
-                                                            match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(page)).await {
-                                                                Ok(Ok(())) => {},
-                                                                Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
-                                                                Err(_) => {
-                                                                    warn!("Output send timeout - consumer too slow, dropping metadata page");
-                                                                }
+                                    if let Some(callback) = &self.metadata_callback
+                                        && let Some(comments) = callback(global_granule_position)
+                                    {
+                                        debug!("Injecting metadata at granule position {}", global_granule_position);
+                                        let sequence = session.stream_processor.get_sequence_number();
+                                        match generate_comment_packet(comments) {
+                                            Ok(packet) => {
+                                                match create_comment_page(packet, serial, sequence, global_granule_position) {
+                                                    Ok(page) => {
+                                                        match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(page)).await {
+                                                            Ok(Ok(())) => {},
+                                                            Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                                                            Err(_) => {
+                                                                warn!("Output send timeout - consumer too slow, dropping metadata page");
                                                             }
                                                         }
-                                                        Err(e) => {
-                                                            warn!("Failed to create metadata page: {}", e);
-                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to create metadata page: {}", e);
                                                     }
                                                 }
-                                                Err(e) => {
-                                                    warn!("Failed to generate metadata packet: {}", e);
-                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to generate metadata packet: {}", e);
                                             }
                                         }
                                     }

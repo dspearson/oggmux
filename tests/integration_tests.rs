@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use oggmux::{BufferConfig, MuxMode, OggMux, VorbisBitrateMode, VorbisConfig};
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 fn create_test_mux() -> OggMux {
     OggMux::new()
@@ -164,8 +164,7 @@ async fn test_concurrent_producers() -> Result<()> {
 #[tokio::test]
 async fn test_gapless_mode_no_silence() -> Result<()> {
     // In gapless mode, mux should NOT insert silence when idle
-    let mux = create_test_mux()
-        .with_mode(MuxMode::Gapless);
+    let mux = create_test_mux().with_mode(MuxMode::Gapless);
 
     let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -190,8 +189,7 @@ async fn test_gapless_mode_no_silence() -> Result<()> {
 #[tokio::test]
 async fn test_with_silence_mode_inserts_silence() -> Result<()> {
     // WithSilence mode should insert silence when idle (default behavior)
-    let mux = create_test_mux()
-        .with_mode(MuxMode::WithSilence);
+    let mux = create_test_mux().with_mode(MuxMode::WithSilence);
 
     let (_tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -213,14 +211,13 @@ async fn test_metadata_callback_invoked() -> Result<()> {
     let callback_invoked = Arc::new(Mutex::new(false));
     let callback_invoked_clone = callback_invoked.clone();
 
-    let mux = create_test_mux()
-        .with_metadata_callback(move |_granule_pos| {
-            *callback_invoked_clone.lock().unwrap() = true;
-            Some(vec![
-                ("TITLE".to_string(), "Test Track".to_string()),
-                ("ARTIST".to_string(), "Test Artist".to_string()),
-            ])
-        });
+    let mux = create_test_mux().with_metadata_callback(move |_granule_pos| {
+        *callback_invoked_clone.lock().unwrap() = true;
+        Some(vec![
+            ("TITLE".to_string(), "Test Track".to_string()),
+            ("ARTIST".to_string(), "Test Artist".to_string()),
+        ])
+    });
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -239,7 +236,10 @@ async fn test_metadata_callback_invoked() -> Result<()> {
     }
 
     // Callback should have been invoked after stream finished
-    assert!(*callback_invoked.lock().unwrap(), "Metadata callback should be invoked after stream");
+    assert!(
+        *callback_invoked.lock().unwrap(),
+        "Metadata callback should be invoked after stream"
+    );
 
     Ok(())
 }
@@ -249,11 +249,10 @@ async fn test_metadata_callback_with_granule_position() -> Result<()> {
     let received_granule = Arc::new(Mutex::new(None));
     let received_granule_clone = received_granule.clone();
 
-    let mux = create_test_mux()
-        .with_metadata_callback(move |granule_pos| {
-            *received_granule_clone.lock().unwrap() = Some(granule_pos);
-            Some(vec![("POSITION".to_string(), granule_pos.to_string())])
-        });
+    let mux = create_test_mux().with_metadata_callback(move |granule_pos| {
+        *received_granule_clone.lock().unwrap() = Some(granule_pos);
+        Some(vec![("POSITION".to_string(), granule_pos.to_string())])
+    });
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -271,8 +270,14 @@ async fn test_metadata_callback_with_granule_position() -> Result<()> {
 
     // Should have received a granule position
     let granule = received_granule.lock().unwrap();
-    assert!(granule.is_some(), "Callback should receive granule position");
-    assert!(*granule.as_ref().unwrap() > 0, "Granule position should be > 0");
+    assert!(
+        granule.is_some(),
+        "Callback should receive granule position"
+    );
+    assert!(
+        *granule.as_ref().unwrap() > 0,
+        "Granule position should be > 0"
+    );
 
     Ok(())
 }
@@ -280,11 +285,7 @@ async fn test_metadata_callback_with_granule_position() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_injection_creates_pages() -> Result<()> {
     let mux = create_test_mux()
-        .with_metadata_callback(|_| {
-            Some(vec![
-                ("TITLE".to_string(), "Test".to_string()),
-            ])
-        });
+        .with_metadata_callback(|_| Some(vec![("TITLE".to_string(), "Test".to_string())]));
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -293,7 +294,8 @@ async fn test_metadata_injection_creates_pages() -> Result<()> {
     let mut packets_received = 0;
 
     // Collect packets
-    while let Ok(Some(_packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+    while let Ok(Some(_packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+    {
         packets_received += 1;
     }
 
@@ -306,8 +308,7 @@ async fn test_metadata_injection_creates_pages() -> Result<()> {
 
 #[tokio::test]
 async fn test_gapless_with_multiple_streams() -> Result<()> {
-    let mux = create_test_mux()
-        .with_mode(MuxMode::Gapless);
+    let mux = create_test_mux().with_mode(MuxMode::Gapless);
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 
@@ -338,8 +339,7 @@ async fn test_gapless_with_multiple_streams() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_callback_returning_none() -> Result<()> {
     // Callback that returns None should not crash or cause issues
-    let mux = create_test_mux()
-        .with_metadata_callback(|_| None);
+    let mux = create_test_mux().with_metadata_callback(|_| None);
 
     let (tx, mut rx, _shutdown, _handle) = mux.spawn();
 

@@ -39,15 +39,15 @@
 //! }
 //! ```
 
+mod comments;
 pub mod metrics;
 mod mux;
 mod silence;
 mod stream;
 mod timing;
-mod comments;
 pub mod utils;
 
 // Re-export public API
 pub use metrics::{MetricStats, MetricsCollector, StreamMetrics};
-pub use mux::{BufferConfig, OggMux, VorbisBitrateMode, VorbisConfig, MuxMode, MetadataCallback};
+pub use mux::{BufferConfig, MetadataCallback, MuxMode, OggMux, VorbisBitrateMode, VorbisConfig};
 pub use utils::{calculate_buffer_size, calculate_buffered_seconds};

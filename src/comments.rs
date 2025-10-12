@@ -61,15 +61,15 @@ pub fn create_comment_page(
     let mut page_data = Vec::new();
 
     // Write header fields
-    page_data.extend_from_slice(b"OggS");  // Capture pattern
-    page_data.extend_from_slice(&[0x00]);  // Version
-    page_data.extend_from_slice(&[0x00]);  // header_type_flag: normal page
+    page_data.extend_from_slice(b"OggS"); // Capture pattern
+    page_data.extend_from_slice(&[0x00]); // Version
+    page_data.extend_from_slice(&[0x00]); // header_type_flag: normal page
     page_data.extend_from_slice(&granule_pos.to_le_bytes());
     page_data.extend_from_slice(&serial.to_le_bytes());
     page_data.extend_from_slice(&sequence.to_le_bytes());
-    page_data.extend_from_slice(&[0, 0, 0, 0]);  // CRC (will calculate later)
-    page_data.extend_from_slice(&[segments.len() as u8]);  // Number of segments
-    page_data.extend_from_slice(&segments);  // Segment table
+    page_data.extend_from_slice(&[0, 0, 0, 0]); // CRC (will calculate later)
+    page_data.extend_from_slice(&[segments.len() as u8]); // Number of segments
+    page_data.extend_from_slice(&segments); // Segment table
 
     // Write packet data
     page_data.extend_from_slice(&packet);
@@ -164,8 +164,7 @@ mod tests {
 
         // Check granule position (offset 6-13, little-endian)
         let granule = u64::from_le_bytes([
-            page[6], page[7], page[8], page[9],
-            page[10], page[11], page[12], page[13]
+            page[6], page[7], page[8], page[9], page[10], page[11], page[12], page[13],
         ]);
         assert_eq!(granule, 1000);
 
@@ -188,7 +187,7 @@ mod tests {
         assert_eq!(page[27], packet.len() as u8);
 
         // Packet data should follow
-        assert_eq!(&page[28..28+packet.len()], &packet[..]);
+        assert_eq!(&page[28..28 + packet.len()], &packet[..]);
     }
 
     #[test]
@@ -205,7 +204,10 @@ mod tests {
 
         // Should have multiple segments
         let segment_count = page[26];
-        assert!(segment_count > 1, "Large packet should need multiple segments");
+        assert!(
+            segment_count > 1,
+            "Large packet should need multiple segments"
+        );
 
         // First segment should be 255
         assert_eq!(page[27], 255);
@@ -228,6 +230,9 @@ mod tests {
         let crc1 = u32::from_le_bytes([page1[22], page1[23], page1[24], page1[25]]);
         let crc2 = u32::from_le_bytes([page2[22], page2[23], page2[24], page2[25]]);
 
-        assert_ne!(crc1, crc2, "Different page content should produce different CRCs");
+        assert_ne!(
+            crc1, crc2,
+            "Different page content should produce different CRCs"
+        );
     }
 }
