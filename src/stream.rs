@@ -211,6 +211,7 @@ impl StreamProcessor {
     }
 
     /// Get current sequence number.
+    #[allow(dead_code)]
     pub fn get_sequence_number(&self) -> u32 {
         self.sequence_number
     }

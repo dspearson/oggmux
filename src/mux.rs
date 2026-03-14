@@ -99,7 +99,13 @@ impl VorbisConfig {
 /// Operating mode for the muxer
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuxMode {
-    /// Insert silence between streams (original behavior for Icecast)
+    /// Insert silence between streams (original behavior for Icecast).
+    ///
+    /// Silence uses a fixed-duration template (embedded .ogg file). The granule
+    /// position is remapped to ensure timing continuity across stream boundaries,
+    /// but the actual audio silence duration is fixed per template regardless of
+    /// how long the input gap lasts. Multiple silence segments may be inserted
+    /// back-to-back for longer gaps.
     WithSilence,
     /// Direct stream concatenation without silence gaps (gapless playback)
     Gapless,
@@ -141,6 +147,10 @@ impl StreamSession {
     ///
     /// For silence, we just process the template once and finalise.
     /// For real data, we process until we reach EOS or run out of input.
+    ///
+    /// If `initial_data` is provided, it is processed as the first chunk before
+    /// entering the main receive loop.
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &mut self,
         input_rx: &mut mpsc::Receiver<Bytes>,
@@ -149,6 +159,7 @@ impl StreamSession {
         buffered_seconds: f64,
         granule_position_ref: &mut u64,
         metrics_collector: Option<MetricsCollector>,
+        initial_data: Option<Bytes>,
     ) -> Result<()> {
         if self.is_silence {
             if let Some(ref template) = self.silence_template {
@@ -164,11 +175,9 @@ impl StreamSession {
                         Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                         Err(_) => {
                             warn!("Output send timeout - consumer too slow, dropping packet");
-                            // Continue processing despite timeout
                         }
                     }
 
-                    // Record output bytes in metrics
                     if let Some(ref mc) = metrics_collector {
                         mc.add_bytes_processed(out.len()).await;
                     }
@@ -193,7 +202,6 @@ impl StreamSession {
                     }
                 }
 
-                // Record output bytes in metrics
                 if let Some(ref mc) = metrics_collector {
                     mc.add_bytes_processed(final_out.len()).await;
                 }
@@ -202,102 +210,126 @@ impl StreamSession {
             return Ok(());
         }
 
-        let mut last_action_time = Instant::now();
-        let input_timeout = Duration::from_millis(500);
+        // Process initial data if provided (first chunk from main loop)
+        if let Some(data) = initial_data {
+            self.process_chunk(
+                &data,
+                output_tx,
+                clock,
+                buffered_seconds,
+                granule_position_ref,
+                &metrics_collector,
+            )
+            .await?;
+        }
 
         loop {
-            // Check if stream is finished before trying to receive more data
             if self.stream_processor.is_finished() {
                 break;
             }
 
+            // Throttle if ahead of real-time
             let lead = clock.lead_secs(*granule_position_ref);
             if lead >= buffered_seconds {
                 sleep(Duration::from_millis(20)).await;
+                continue;
             }
 
-            match input_rx.try_recv() {
-                Ok(data) => {
-                    last_action_time = Instant::now();
-                    // Track processing time for metrics
-                    let process_start = Instant::now();
-                    let out = self
-                        .stream_processor
-                        .process(&data)
-                        .context("processing real audio chunk")?;
-
-                    // Record processing latency in metrics
-                    if let Some(mc) = &metrics_collector {
-                        let latency = process_start.elapsed().as_secs_f64() * 1000.0;
-                        mc.record_processing_latency(latency).await;
-                    }
-
-                    if !out.is_empty() {
-                        self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                            .await;
-                        match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
-                            Err(_) => {
-                                warn!(
-                                    "Output send timeout - consumer too slow, dropping real audio packet"
-                                );
-                            }
+            tokio::select! {
+                biased;
+                maybe_data = input_rx.recv() => {
+                    match maybe_data {
+                        Some(data) => {
+                            self.process_chunk(&data, output_tx, clock, buffered_seconds, granule_position_ref, &metrics_collector).await?;
                         }
-
-                        // Record output bytes in metrics
-                        if let Some(mc) = &metrics_collector {
-                            mc.add_bytes_processed(out.len()).await;
-                        }
-                    }
-                    *granule_position_ref = self.stream_processor.get_granule_position();
-
-                    // Record buffer utilization
-                    if let Some(mc) = &metrics_collector {
-                        let lead = clock.lead_secs(*granule_position_ref);
-                        let utilization = (lead / buffered_seconds) * 100.0;
-                        mc.record_buffer_utilization(utilization).await;
+                        None => break, // input closed
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Check if we've been waiting too long with no valid output
-                    if !self.stream_processor.has_produced_output()
-                        && last_action_time.elapsed() > input_timeout
-                    {
-                        debug!(
-                            "No valid output produced after timeout; breaking to restart with silence"
-                        );
-                        break;
+                _ = sleep(Duration::from_millis(500)) => {
+                    if !self.stream_processor.has_produced_output() {
+                        debug!("No valid output after timeout; breaking to restart with silence");
                     }
-                    sleep(Duration::from_millis(10)).await;
+                    // Current stream likely done — no new data for 500ms
+                    break;
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 
-        let final_out = self
-            .stream_processor
-            .finalise()
-            .context("finalising real stream")?;
-        if !final_out.is_empty() {
-            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
-                .await;
-            match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
-                Err(_) => {
-                    warn!(
-                        "Output send timeout - consumer too slow, dropping final real audio packet"
-                    );
+        match self.stream_processor.finalise() {
+            Ok(final_out) => {
+                if !final_out.is_empty() {
+                    self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                        .await;
+                    match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(final_out.clone())).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                        Err(_) => {
+                            warn!(
+                                "Output send timeout - consumer too slow, dropping final real audio packet"
+                            );
+                        }
+                    }
+
+                    if let Some(mc) = &metrics_collector {
+                        mc.add_bytes_processed(final_out.len()).await;
+                    }
                 }
             }
-
-            // Record output bytes in metrics
-            if let Some(mc) = &metrics_collector {
-                mc.add_bytes_processed(final_out.len()).await;
+            Err(e) => {
+                warn!("Error finalising real stream: {}", e);
             }
         }
         *granule_position_ref = self.stream_processor.get_granule_position();
+        Ok(())
+    }
+
+    /// Process a single chunk of real audio data, sending output and recording metrics.
+    async fn process_chunk(
+        &mut self,
+        data: &[u8],
+        output_tx: &mpsc::Sender<Bytes>,
+        clock: &StreamClock,
+        buffered_seconds: f64,
+        granule_position_ref: &mut u64,
+        metrics_collector: &Option<MetricsCollector>,
+    ) -> Result<()> {
+        let process_start = Instant::now();
+        let out = match self.stream_processor.process(data) {
+            Ok(out) => out,
+            Err(e) => {
+                warn!("Error processing chunk in stream session: {}", e);
+                return Ok(()); // Non-fatal: skip this chunk
+            }
+        };
+
+        if let Some(mc) = metrics_collector {
+            let latency = process_start.elapsed().as_secs_f64() * 1000.0;
+            mc.record_processing_latency(latency).await;
+        }
+
+        if !out.is_empty() {
+            self.maybe_sleep(clock, buffered_seconds, *granule_position_ref)
+                .await;
+            match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
+                Err(_) => {
+                    warn!("Output send timeout - consumer too slow, dropping real audio packet");
+                }
+            }
+
+            if let Some(mc) = metrics_collector {
+                mc.add_bytes_processed(out.len()).await;
+            }
+        }
+        *granule_position_ref = self.stream_processor.get_granule_position();
+
+        if let Some(mc) = metrics_collector {
+            let lead = clock.lead_secs(*granule_position_ref);
+            let utilization = (lead / buffered_seconds) * 100.0;
+            mc.record_buffer_utilization(utilization).await;
+        }
+
         Ok(())
     }
 
@@ -582,6 +614,7 @@ impl OggMux {
             // Wrap in Result for `?`
             let run_res: Result<()> = async {
                 debug!("OggMux main loop started");
+                let mut pending_metadata: Option<Vec<(String, String)>> = None;
                 loop {
                     // Shutdown if output is closed
                     if output_tx.is_closed() {
@@ -590,6 +623,7 @@ impl OggMux {
                     }
 
                     tokio::select! {
+                        biased;
                         _ = shutdown_rx.recv() => {
                             debug!("Shutdown signal received; exiting mux loop");
                             break;
@@ -602,69 +636,46 @@ impl OggMux {
 
                                     let mut session = StreamSession::new_real(serial, global_granule_position);
 
-                                    // Record real stream in metrics
-                                    if let Some(ref mc) = metrics_collector {
-                                        mc.increment_real_streams().await;
-                                    }
-
-                                    // Process first real chunk
-                                    let process_start = Instant::now();
-                                    let out = session.stream_processor.process(&first_chunk)
-                                        .context("processing initial real chunk")?;
-
-                                    // Record processing latency
-                                    if let Some(ref mc) = metrics_collector {
-                                        let latency = process_start.elapsed().as_secs_f64() * 1000.0;
-                                        mc.record_processing_latency(latency).await;
-                                    }
-
-                                    if !out.is_empty() {
-                                        session.maybe_sleep(&clock, buffered_seconds, global_granule_position).await;
-                                        match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(out.clone())).await {
-                                            Ok(Ok(())) => {},
-                                            Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
-                                            Err(_) => {
-                                                warn!("Output send timeout - consumer too slow, dropping initial real audio packet");
-                                            }
-                                        }
-
-                                        // Record output bytes
-                                        if let Some(ref mc) = metrics_collector {
-                                            mc.add_bytes_processed(out.len()).await;
-                                        }
-                                    }
-                                    global_granule_position = session.stream_processor.get_granule_position();
-
-                                    // Continue session
-                                    session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
-
-                                    // Inject metadata if callback is configured
-                                    if let Some(callback) = &self.metadata_callback
-                                        && let Some(comments) = callback(global_granule_position)
-                                    {
-                                        debug!("Injecting metadata at granule position {}", global_granule_position);
-                                        let sequence = session.stream_processor.get_sequence_number();
+                                    // Inject pending metadata with this new stream's serial
+                                    if let Some(comments) = pending_metadata.take() {
+                                        debug!("Injecting pending metadata into new stream serial=0x{:x}", serial);
                                         match generate_comment_packet(comments) {
                                             Ok(packet) => {
-                                                match create_comment_page(packet, serial, sequence, global_granule_position) {
+                                                match create_comment_page(packet, serial, 0, global_granule_position) {
                                                     Ok(page) => {
                                                         match timeout(OUTPUT_SEND_TIMEOUT, output_tx.send(page)).await {
                                                             Ok(Ok(())) => {},
                                                             Ok(Err(_)) => return Err(anyhow::anyhow!("output channel closed")),
                                                             Err(_) => {
-                                                                warn!("Output send timeout - consumer too slow, dropping metadata page");
+                                                                warn!("Output send timeout - dropping metadata page");
                                                             }
                                                         }
                                                     }
-                                                    Err(e) => {
-                                                        warn!("Failed to create metadata page: {}", e);
-                                                    }
+                                                    Err(e) => warn!("Failed to create metadata page: {}", e),
                                                 }
                                             }
-                                            Err(e) => {
-                                                warn!("Failed to generate metadata packet: {}", e);
-                                            }
+                                            Err(e) => warn!("Failed to generate metadata packet: {}", e),
                                         }
+                                    }
+
+                                    // Record real stream in metrics
+                                    if let Some(ref mc) = metrics_collector {
+                                        mc.increment_real_streams().await;
+                                    }
+
+                                    // Run session with first chunk as initial data
+                                    session.run(
+                                        &mut input_rx, &output_tx, &clock, buffered_seconds,
+                                        &mut global_granule_position, metrics_collector.clone(),
+                                        Some(first_chunk),
+                                    ).await?;
+
+                                    // Store pending metadata for injection at the start of the next stream
+                                    if let Some(callback) = &self.metadata_callback
+                                        && let Some(comments) = callback(global_granule_position)
+                                    {
+                                        debug!("Storing pending metadata for next stream (granule={})", global_granule_position);
+                                        pending_metadata = Some(comments);
                                     }
                                 }
                                 None => {
@@ -692,7 +703,7 @@ impl OggMux {
                                     mc.add_silence_bytes(silence_data.len()).await;
                                 }
 
-                                session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone()).await?;
+                                session.run(&mut input_rx, &output_tx, &clock, buffered_seconds, &mut global_granule_position, metrics_collector.clone(), None).await?;
                             } else {
                                 debug!("Gapless mode: waiting for input without silence");
                             }

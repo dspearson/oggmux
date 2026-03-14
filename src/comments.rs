@@ -81,18 +81,20 @@ pub fn create_comment_page(
     Ok(Bytes::from(page_data))
 }
 
-/// Calculate CRC32 for an Ogg page (using the Ogg CRC polynomial).
+/// Calculate CRC32 for an Ogg page (using the Ogg CRC polynomial 0x04C11DB7).
+///
+/// This is a non-reflected (MSB-first) CRC as specified by the Ogg framing spec.
 fn calculate_crc(data: &[u8]) -> u32 {
     let mut crc: u32 = 0;
 
     for &byte in data {
-        let mut value = ((crc >> 24) & 0xFF) ^ (byte as u32);
+        let mut value = ((crc >> 24) ^ (byte as u32)) << 24;
 
         for _ in 0..8 {
-            if (value & 1) != 0 {
-                value = (value >> 1) ^ 0x04C11DB7;
+            if (value & 0x80000000) != 0 {
+                value = (value << 1) ^ 0x04C11DB7;
             } else {
-                value >>= 1;
+                value <<= 1;
             }
         }
 
@@ -234,5 +236,45 @@ mod tests {
             crc1, crc2,
             "Different page content should produce different CRCs"
         );
+    }
+
+    #[test]
+    fn test_crc_matches_ogg_pager() {
+        // Build a page manually, then verify our CRC matches what ogg_pager produces
+        // for identical page content.
+        use ogg_pager::Page;
+        use std::io::Cursor;
+
+        let packet = vec![0x03, b'v', b'o', b'r', b'b', b'i', b's'];
+        let page_bytes = create_comment_page(packet, 0xDEADBEEF, 7, 44100).unwrap();
+
+        // Parse the page with ogg_pager to verify it's well-formed and CRC-valid
+        let mut cursor = Cursor::new(&page_bytes[..]);
+        let parsed = Page::read(&mut cursor)
+            .expect("ogg_pager should accept our page as valid (CRC must match)");
+
+        // Verify the parsed page has the expected fields
+        assert_eq!(parsed.header().stream_serial, 0xDEADBEEF);
+        assert_eq!(parsed.header().sequence_number, 7);
+        assert_eq!(parsed.header().abgp, 44100);
+    }
+
+    #[test]
+    fn test_crc_known_value() {
+        // CRC of an empty data slice should be 0
+        assert_eq!(calculate_crc(&[]), 0);
+
+        // CRC of a non-trivial byte should be non-zero
+        let crc = calculate_crc(&[0x01]);
+        assert_ne!(crc, 0, "CRC of [0x01] should be non-zero");
+
+        // Verify the algorithm is deterministic
+        assert_eq!(
+            calculate_crc(&[0x4F, 0x67, 0x67, 0x53]),
+            calculate_crc(b"OggS")
+        );
+
+        // Verify it produces different values for different inputs
+        assert_ne!(calculate_crc(&[0x01]), calculate_crc(&[0x02]));
     }
 }
